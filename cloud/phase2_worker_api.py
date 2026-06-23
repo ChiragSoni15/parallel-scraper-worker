@@ -13,7 +13,9 @@ import argparse
 import json
 import logging
 import os
+import queue
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -25,8 +27,20 @@ from cloud.phase2_common import P2Result, _default_session_factory, _split_image
 logger = logging.getLogger(__name__)
 
 
+def _resolve_concurrency(concurrency) -> int:
+    """Resolve K from the arg or PHASE2_CONCURRENCY (default 1), clamped to [1, 5]."""
+    if concurrency is None:
+        concurrency = os.environ.get("PHASE2_CONCURRENCY", "1")
+    try:
+        k = int(concurrency)
+    except (TypeError, ValueError):
+        k = 1
+    return max(1, min(5, k))
+
+
 def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
-               session_factory=None, flush_interval_s=None, max_places=None) -> P2Result:
+               session_factory=None, flush_interval_s=None, max_places=None,
+               concurrency=None) -> P2Result:
     state = state if state is not None else HttpState()
     flush_interval_s = (
         float(os.environ.get("PHASE2_FLUSH_INTERVAL_S", "20"))
@@ -36,6 +50,13 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
     run_id_var.set(run_id)
     if state.get_run(run_id) is None:
         raise RuntimeError(f"run_id not found / not allowed: {run_id}")
+
+    k = _resolve_concurrency(concurrency)
+    if k > 1:
+        return _run_worker_concurrent(
+            run_id, shard, k, max_minutes=max_minutes, batch=batch, state=state,
+            session_factory=session_factory, flush_interval_s=flush_interval_s,
+            max_places=max_places)
 
     if str(shard) == "0":
         try:
@@ -126,6 +147,181 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
     return result
 
 
+def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state):
+    """Scrape a single pid on `session`. Return (done_dict_or_None, failed_dict_or_None).
+
+    Screenshot upload uses `shot_state` (this thread's own HttpState) and is
+    best-effort: a failed upload must never fail the scrape or block the submit.
+    """
+    try:
+        row = session.scrape(pid)
+        if not row or (row.get("name") or "") in ("", "FAILED"):
+            raise RuntimeError("blank-after-warmup / no data")
+        urls = _split_image_urls(row.get("image_urls"))
+        done = {"place_id": pid, "attempts": attempts,
+                "data": json.dumps(row, default=str), "image_urls": urls}
+        if capture_shots:
+            try:
+                shots = (session.screenshot_paths(pid)
+                         if hasattr(session, "screenshot_paths") else {})
+                if shots:
+                    shot_state.upload_screenshots(run_id, pid, attempts, shots)
+            except Exception:
+                logger.warning("phase2.shot_upload_failed run_id=%s pid=%s",
+                               run_id, pid, exc_info=True)
+        return done, None
+    except Exception as exc:
+        logger.warning("phase2.place_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
+        return None, {"place_id": pid, "attempts": attempts, "error": str(exc)}
+
+
+def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
+                           session_factory, flush_interval_s, max_places) -> P2Result:
+    """K>1 path: K worker threads, each with its own PlaywrightSession + HttpState.
+
+    Feeder (this thread) leases pids onto a queue; workers scrape; this thread
+    also flushes submitted results every flush_interval_s. Each leased pid is
+    submitted exactly once (done XOR failed). K==1 never reaches here.
+    """
+    if str(shard) == "0":
+        try:
+            logger.info("phase2.reclaim run_id=%s reclaimed=%d", run_id, state.reclaim_place_ids(run_id, 30))
+        except Exception:
+            logger.warning("phase2.reclaim_failed", exc_info=True)
+
+    result = P2Result()
+    started = time.monotonic()
+    stop_after = max(0.0, float(max_minutes) * 60.0 - 300.0)
+    recycle_every = int(os.environ.get("PHASE2_RECYCLE_EVERY", "50"))
+    capture_shots = os.environ.get("PHASE2_CAPTURE_SCREENSHOTS", "1") != "0"
+    factory = session_factory or (lambda **kw: _default_session_factory(kw["work_dir"]))
+
+    pend_done: list[dict] = []
+    pend_failed: list[dict] = []
+    lock = threading.Lock()
+    work_q: "queue.Queue" = queue.Queue()  # unbounded: items are tiny tuples
+    _SENTINEL = object()
+    sessions: list = []
+    sessions_lock = threading.Lock()
+    leased_total = 0  # feeder-only
+
+    logger.info("phase2.concurrent_start run_id=%s shard=%s k=%d", run_id, shard, k)
+
+    def worker(idx: int):
+        try:
+            work_dir = tempfile.mkdtemp(prefix=f"p2api_{idx}_")
+            session = factory(work_dir=work_dir)
+            shot_state = HttpState() if state.__class__ is HttpState else state.__class__()
+        except Exception:
+            # Session/state setup failed: drain the queue marking pids failed so
+            # nothing is lost, until a sentinel arrives. Never block the feeder.
+            logger.warning("phase2.worker_setup_failed idx=%d", idx, exc_info=True)
+            while True:
+                item = work_q.get()
+                if item is _SENTINEL:
+                    return
+                pid, attempts = item
+                with lock:
+                    pend_failed.append({"place_id": pid, "attempts": attempts,
+                                        "error": "worker setup failed"})
+            return
+        with sessions_lock:
+            sessions.append(session)
+        n_since_recycle = 0
+        while True:
+            item = work_q.get()
+            if item is _SENTINEL:
+                return
+            pid, attempts = item
+            done, failed = _scrape_one(session, run_id, pid, attempts,
+                                       capture_shots, shot_state)
+            with lock:
+                if done is not None:
+                    pend_done.append(done)
+                else:
+                    pend_failed.append(failed)
+            n_since_recycle += 1
+            if n_since_recycle >= recycle_every:
+                try:
+                    session.recycle()
+                except Exception:
+                    logger.debug("recycle_failed", exc_info=True)
+                n_since_recycle = 0
+
+    def flush():
+        with lock:
+            done = pend_done[:]
+            failed = pend_failed[:]
+            pend_done.clear()
+            pend_failed.clear()
+        if done or failed:
+            out = state.submit(run_id, done, failed)
+            acc = int(out.get("accepted", 0))
+            stale = int(out.get("stale", 0))
+            result.done += len(done)
+            result.failed += len(failed)
+            logger.info("phase2.flush submitted=%d accepted=%d stale=%d done_total=%d failed_total=%d rps=%.3f",
+                        len(done) + len(failed), acc, stale, result.done, result.failed,
+                        (result.done + result.failed) / max(0.001, time.monotonic() - started))
+
+    threads = [threading.Thread(target=worker, args=(i,), name=f"p2-worker-{i}", daemon=True)
+               for i in range(k)]
+    for t in threads:
+        t.start()
+
+    # Feeder: lease pids until empty, the time budget, or max_places; then sentinels.
+    # BACKPRESSURE: keep at most a small buffer queued (~one batch). Without this the
+    # feeder leases batch-after-batch into the unbounded queue and a fast-starting shard
+    # marks thousands of pids 'scraping' ahead of its K workers — starving the other 19
+    # shards and ballooning reclaim if it dies. We only lease another batch once the
+    # queue has drained below the high-water mark.
+    high_water = max(int(batch), 2 * k)
+    last_flush = started
+    try:
+        while True:
+            now = time.monotonic()
+            if stop_after and (now - started) > stop_after:
+                logger.info("phase2.time_budget_exit run_id=%s shard=%s", run_id, shard)
+                break
+            if max_places is not None and leased_total >= max_places:
+                break
+            # Hold off leasing while the workers still have a buffer; flush on interval.
+            if work_q.qsize() >= high_water:
+                if flush_interval_s and (now - last_flush) >= flush_interval_s:
+                    flush()
+                    last_flush = time.monotonic()
+                time.sleep(0.2)
+                continue
+            leased = state.claim_place_ids(run_id, str(shard), int(batch))
+            if not leased:
+                break
+            for rec in leased:
+                pid = str(rec["place_id"])
+                attempts = int(rec["attempts"])
+                work_q.put((pid, attempts))
+                leased_total += 1
+            # Mid-run flush so results land while workers keep scraping.
+            if flush_interval_s and (time.monotonic() - last_flush) >= flush_interval_s:
+                flush()
+                last_flush = time.monotonic()
+    finally:
+        for _ in range(k):
+            work_q.put(_SENTINEL)
+        for t in threads:
+            t.join()
+        flush()  # final flush after every pid is accounted for
+        with sessions_lock:
+            for s in sessions:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    logger.info("phase2.complete run_id=%s shard=%s done=%d failed=%d k=%d",
+                run_id, shard, result.done, result.failed, k)
+    return result
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-id", required=True)
@@ -133,10 +329,13 @@ def main(argv=None) -> int:
     ap.add_argument("--max-minutes", type=float, default=300)
     ap.add_argument("--batch", type=int, default=20)
     ap.add_argument("--max-places", type=int)
+    ap.add_argument("--concurrency", type=int, default=None,
+                    help="placeIds scraped at once per shard (1-5; env PHASE2_CONCURRENCY is the fallback)")
     args = ap.parse_args(argv)
     setup_logging(None, level="INFO")
     run_worker(args.run_id, args.shard, max_minutes=args.max_minutes,
-               batch=args.batch, max_places=args.max_places)
+               batch=args.batch, max_places=args.max_places,
+               concurrency=args.concurrency)
     return 0
 
 

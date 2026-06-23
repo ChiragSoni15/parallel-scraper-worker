@@ -12,6 +12,7 @@ on:
       run_id:      { required: true,  type: string }
       shards:      { required: false, type: string, default: "12" }
       max_minutes: { required: false, type: string, default: "300" }
+      concurrency: { required: false, type: string, default: "3" }   # placeIds scraped at once PER shard (1-5)
 
 concurrency:
   group: phase2-${{ inputs.run_id }}
@@ -100,8 +101,12 @@ jobs:
           # Drive. The public worker still holds NO Drive creds — only the API (on the VM)
           # does. Screenshots are recorded under the same lease guard as results.
           PHASE2_CAPTURE_SCREENSHOTS: "1"
+          # placeIds scraped at once per shard (1 = sequential). Each adds a browser, so
+          # it raises this runner's per-IP request rate — watch the failed/block rate.
+          PHASE2_CONCURRENCY: "${{ inputs.concurrency }}"
         run: >
           python -m cloud.phase2_worker_api
           --run-id "${{ inputs.run_id }}"
           --shard "${{ matrix.shard }}"
           --max-minutes "${{ inputs.max_minutes }}"
+          --concurrency "${{ inputs.concurrency }}"
