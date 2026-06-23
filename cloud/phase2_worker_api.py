@@ -51,6 +51,7 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
     last_flush = started
     stop_after = max(0.0, float(max_minutes) * 60.0 - 300.0)
     recycle_every = int(os.environ.get("PHASE2_RECYCLE_EVERY", "50"))
+    capture_shots = os.environ.get("PHASE2_CAPTURE_SCREENSHOTS", "1") != "0"
     pend_done: list[dict] = []
     pend_failed: list[dict] = []
 
@@ -91,6 +92,18 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
                     urls = _split_image_urls(row.get("image_urls"))
                     pend_done.append({"place_id": pid, "attempts": attempts,
                                       "data": json.dumps(row, default=str), "image_urls": urls})
+                    # Page screenshots ride a separate multipart endpoint (bytes -> API ->
+                    # Drive), guarded by the same lease attempts. Best-effort: a failed
+                    # upload must never fail the scrape or block the metadata submit.
+                    if capture_shots:
+                        try:
+                            shots = (session.screenshot_paths(pid)
+                                     if hasattr(session, "screenshot_paths") else {})
+                            if shots:
+                                state.upload_screenshots(run_id, pid, attempts, shots)
+                        except Exception:
+                            logger.warning("phase2.shot_upload_failed run_id=%s pid=%s",
+                                           run_id, pid, exc_info=True)
                 except Exception as exc:
                     logger.warning("phase2.place_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
                     pend_failed.append({"place_id": pid, "attempts": attempts, "error": str(exc)})

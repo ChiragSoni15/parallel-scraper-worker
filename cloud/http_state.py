@@ -65,3 +65,28 @@ class HttpState:
         out = self._request("POST", "/phase2/reclaim",
                             json={"run_id": run_id, "older_than_minutes": int(older_than_minutes)})
         return int(out.get("reclaimed", 0))
+
+    def upload_screenshots(self, run_id: str, place_id: str, attempts: int, paths: dict) -> dict:
+        """POST page-screenshot bytes (multipart) to the API, which uploads them to Drive.
+        `paths` = {kind: local_png_path}. Carries the lease `attempts` so the server can
+        reject stale uploads. Best-effort — the worker wraps this in try/except."""
+        if not paths:
+            return {"accepted": 0, "stale": 0, "kinds": []}
+        handles = []
+        try:
+            files = []
+            for kind, p in paths.items():
+                fh = open(p, "rb")
+                handles.append(fh)
+                files.append((kind, (f"{place_id}_{kind}.png", fh, "image/png")))
+            r = self._s.post(self.base + "/phase2/screenshots",
+                             data={"run_id": run_id, "place_id": place_id, "attempts": int(attempts)},
+                             files=files, timeout=self.timeout)
+            r.raise_for_status()
+            return r.json()
+        finally:
+            for fh in handles:
+                try:
+                    fh.close()
+                except Exception:
+                    pass

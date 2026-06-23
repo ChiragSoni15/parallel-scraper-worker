@@ -60,6 +60,21 @@ def _safe_place_id_dirname(place_id: str) -> str:
     return "".join(safe) or "unknown_place"
 
 
+def _shot_paths(shots_dir: str, place_id: str) -> dict:
+    """Map each panel kind to its on-disk PNG path, for kinds that actually exist.
+
+    Mirrors the names written by ``_capture_panels`` (``{safe}_overview.png`` /
+    ``{safe}_reviews.png``). Returns ``{}`` when no screenshots were captured.
+    """
+    safe = _safe_place_id_dirname(place_id)
+    out = {}
+    for kind in ("overview", "reviews"):
+        p = Path(shots_dir) / f"{safe}_{kind}.png"
+        if p.exists():
+            out[kind] = str(p)
+    return out
+
+
 def _dedupe_image_urls(image_urls_str: str, max_images: int = 50) -> list[str]:
     """Parse the ';'-joined URL string into a deduped, capped list. Dedupe is
     by URL base (size/qs suffix stripped) so a thumb + full-size of the same
@@ -305,13 +320,17 @@ class PlaywrightSession:
     """
 
     def __init__(self, csv_path: str, failures_path: str, delay_ms: int = 500,
-                 full_relaunch_every: int = 10) -> None:
+                 full_relaunch_every: int = 10, capture_screenshots: bool = False) -> None:
         if not _IMPORT_OK:
             raise RuntimeError(f"vendored pipeline extractor import failed: {_IMPORT_ERROR}")
         self._csv_path = str(csv_path)
         self._failures_path = str(failures_path)
         self._delay_ms = int(delay_ms)
         self._full_relaunch_every = int(full_relaunch_every)
+        self._capture_screenshots = bool(capture_screenshots)
+        self._shots_dir = Path(csv_path).parent / "screenshots"
+        if self._capture_screenshots:
+            self._shots_dir.mkdir(parents=True, exist_ok=True)
         self._recycle_count = 0
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
@@ -468,7 +487,92 @@ class PlaywrightSession:
                 photo_urls=False,
                 result_cb=on_row,
             )
+            # Best-effort panel screenshots for LLM review. The page is left on
+            # the Reviews tab (Sort=Newest) by the extractor, so we shoot that
+            # first, then flip to Overview. Never fails the scrape.
+            if self._capture_screenshots and captured:
+                name = (captured[0].get("name") or "").strip()
+                if name and name != "FAILED":
+                    try:
+                        await self._capture_panels(place_id)
+                    except Exception:
+                        logger.debug("phase2_session.capture_panels_failed place_id=%s",
+                                     place_id, exc_info=True)
 
         self._loop.run_until_complete(_do())
         self.places_scraped += 1
         return captured[0] if captured else None
+
+    def screenshot_paths(self, place_id: str) -> dict:
+        """Return {kind: png_path} for the panel screenshots captured for this place
+        (empty if capture is off or nothing was written). Used by the API-mode worker
+        to know which files to upload."""
+        if not self._capture_screenshots:
+            return {}
+        return _shot_paths(str(self._shots_dir), place_id)
+
+    # ── screenshots (optional, for LLM review) ─────────────────
+
+    async def _shot_panel(self, page, out_path: "Path") -> None:
+        """Screenshot the left place-panel element only (excludes the map),
+        clipped to the visible viewport so a long reviews feed isn't captured
+        in full. Best-effort."""
+        try:
+            panel = await page.query_selector('div[role="main"]')
+            if panel is None:
+                return
+            box = await panel.bounding_box()
+            if not box:
+                return
+            vp = page.viewport_size or {"width": 1920, "height": 1080}
+            x, y = max(0.0, box["x"]), max(0.0, box["y"])
+            clip = {"x": x, "y": y,
+                    "width": min(box["width"], vp["width"] - x),
+                    "height": min(box["height"], vp["height"] - y)}
+            if clip["width"] <= 1 or clip["height"] <= 1:
+                return
+            await page.screenshot(path=str(out_path), clip=clip)
+        except Exception:
+            logger.debug("phase2_session.shot_panel_failed path=%s", out_path, exc_info=True)
+
+    async def _click_overview(self, page) -> bool:
+        for sel in ('button[aria-label*="Overview" i][role="tab"]',
+                    'button[role="tab"][data-tab-index="0"]',
+                    'button[aria-label*="Overview" i]'):
+            try:
+                tab = await page.query_selector(sel)
+                if tab:
+                    await tab.click(timeout=2000)
+                    return True
+            except Exception:
+                continue
+        # Fallbacks by accessible role / visible label (handles tabs whose
+        # aria-label is localized or "Overview of <place>").
+        for getter in (lambda: page.get_by_role("tab", name="Overview"),
+                       lambda: page.get_by_text("Overview", exact=True)):
+            try:
+                await getter().first.click(timeout=2000)
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _capture_panels(self, place_id: str) -> None:
+        page = self._page
+        safe = _safe_place_id_dirname(place_id)
+        # A Reviews tab only exists when the place has reviews. If so, the page
+        # is currently on it (extractor sorted by Newest) — shoot the histogram +
+        # reviews, then flip to Overview. If there are NO reviews, Maps shows a
+        # single panel (the overview content) with no tab bar — capture it once,
+        # correctly named _overview.
+        reviews_tab = await page.query_selector(
+            'button[role="tab"][aria-label*="Reviews" i], '
+            'button[aria-label^="Reviews for" i]'
+        )
+        if reviews_tab is not None:
+            await self._shot_panel(page, self._shots_dir / f"{safe}_reviews.png")
+            if await self._click_overview(page):
+                await page.wait_for_timeout(500)
+                await self._shot_panel(page, self._shots_dir / f"{safe}_overview.png")
+        else:
+            await self._shot_panel(page, self._shots_dir / f"{safe}_overview.png")

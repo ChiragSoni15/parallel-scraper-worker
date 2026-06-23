@@ -85,7 +85,10 @@ jobs:
         env:
           WORKER_API_BASE: ${{ vars.WORKER_API_BASE }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
-          PHASE2_CAPTURE_SCREENSHOTS: "0"   # metadata + CDN URLs only; no Drive on public compute
+          # Capture page screenshots and POST the bytes to the API, which uploads to
+          # Drive. The public worker still holds NO Drive creds — only the API (on the VM)
+          # does. Screenshots are recorded under the same lease guard as results.
+          PHASE2_CAPTURE_SCREENSHOTS: "1"
         run: >
           python -m cloud.phase2_worker_api
           --run-id "${{ inputs.run_id }}"

@@ -19,6 +19,7 @@ dependencies = [
     "questionary>=2.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
+    "python-multipart>=0.0.9",
     "requests>=2.31",
     # Transitive: the vendored extractor's gdrive_upload imports these at module load.
     "google-auth>=2.0",
