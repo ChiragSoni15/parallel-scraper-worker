@@ -26,21 +26,30 @@ class HttpState:
         if ca_bundle:
             self._s.verify = ca_bundle
 
+    # Retry transient 5xx / connection errors long enough to ride out a single API pod
+    # restart or a brief overload (a single replica means there IS such a window). With
+    # the defaults below the backoff sums to ~90s before giving up. lease/submit are
+    # idempotent server-side (submit is lease-guarded; re-leasing at worst grabs a few
+    # extra pids that get processed once), so retrying is safe.
+    _ATTEMPTS = int(os.environ.get("WORKER_HTTP_ATTEMPTS", "12"))
+    _BACKOFF_CAP = float(os.environ.get("WORKER_HTTP_BACKOFF_CAP_S", "10"))
+
     def _request(self, method: str, path: str, *, json=None, params=None):
         last = None
-        for attempt in range(4):
+        for attempt in range(self._ATTEMPTS):
+            final = attempt == self._ATTEMPTS - 1
             try:
                 r = self._s.request(method, self.base + path, json=json, params=params, timeout=self.timeout)
-                if r.status_code >= 500 and attempt < 3:
+                if r.status_code >= 500 and not final:
                     last = RuntimeError(f"{r.status_code}: {r.text[:200]}")
-                    time.sleep((0.5 * (2 ** attempt)) + random.uniform(0, 0.3))
+                    time.sleep(min(self._BACKOFF_CAP, 0.5 * (2 ** attempt)) + random.uniform(0, 0.5))
                     continue
                 r.raise_for_status()
                 return r.json()
             except requests.RequestException as exc:
                 last = exc
-                if attempt < 3:
-                    time.sleep((0.5 * (2 ** attempt)) + random.uniform(0, 0.3))
+                if not final:
+                    time.sleep(min(self._BACKOFF_CAP, 0.5 * (2 ** attempt)) + random.uniform(0, 0.5))
                     continue
                 raise
         if last is not None:
