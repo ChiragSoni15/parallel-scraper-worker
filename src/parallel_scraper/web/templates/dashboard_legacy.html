@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>parallel-scraper</title>
+  <link rel="stylesheet" href="/static/oat/oat.min.css">
+  <link rel="stylesheet" href="/static/leaflet/leaflet.css">
+  <link rel="stylesheet" href="/static/leaflet/leaflet.draw.css">
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script src="/static/oat/oat.min.js" defer></script>
+  <script src="/static/leaflet/leaflet.js"></script>
+  <script src="/static/leaflet/leaflet.draw.js"></script>
+  <script src="/static/dashboard.js" defer></script>
+</head>
+<body>
+
+<aside class="sidebar">
+  <header class="brand-block">
+    <span class="logo-mark">▮▮▮</span>
+    <span class="brand-name">parallel-scraper</span>
+  </header>
+
+  <nav class="nav-primary">
+    <a href="#/" class="nav-item" data-route="/"><span class="ico">⊟</span> All Runs</a>
+    <a href="#/new" class="nav-item" data-route="/new"><span class="ico">＋</span> New Run</a>
+  </nav>
+
+  <section class="recent-runs-section">
+    <header>
+      <h6>recent runs</h6>
+      <button class="ghost small" id="refresh-btn" title="Refresh">↻</button>
+    </header>
+    <ul class="run-list" id="run-list" data-empty="no runs yet"></ul>
+  </section>
+
+  <footer class="sidebar-footer">
+    <span class="muted small">v0.1 · local-first · zero-cost</span>
+  </footer>
+</aside>
+
+<main class="main">
+
+  <!-- ─── VIEW: WELCOME ─────────────────────────────── -->
+  <section class="view view-welcome" data-view="welcome">
+    <div class="welcome-bg">
+      <div class="grid-overlay"></div>
+    </div>
+    <div class="welcome-card">
+      <div class="welcome-globe" aria-hidden="true">
+        <svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <radialGradient id="globeFill" cx="50%" cy="40%">
+              <stop offset="0%" stop-color="#4a90ff" stop-opacity="0.3"/>
+              <stop offset="100%" stop-color="#0a1428" stop-opacity="0.0"/>
+            </radialGradient>
+          </defs>
+          <circle cx="100" cy="100" r="80" fill="url(#globeFill)" stroke="#4a90ff" stroke-opacity="0.6" stroke-width="0.8"/>
+          <ellipse cx="100" cy="100" rx="80" ry="20" fill="none" stroke="#4a90ff" stroke-opacity="0.5"/>
+          <ellipse cx="100" cy="100" rx="80" ry="40" fill="none" stroke="#4a90ff" stroke-opacity="0.4"/>
+          <ellipse cx="100" cy="100" rx="80" ry="60" fill="none" stroke="#4a90ff" stroke-opacity="0.3"/>
+          <ellipse cx="100" cy="100" rx="80" ry="78" fill="none" stroke="#4a90ff" stroke-opacity="0.2"/>
+          <line x1="100" y1="20" x2="100" y2="180" stroke="#4a90ff" stroke-opacity="0.5"/>
+          <ellipse cx="100" cy="100" rx="60" ry="80" fill="none" stroke="#4a90ff" stroke-opacity="0.4" transform="rotate(30 100 100)"/>
+          <ellipse cx="100" cy="100" rx="40" ry="80" fill="none" stroke="#4a90ff" stroke-opacity="0.3" transform="rotate(60 100 100)"/>
+          <ellipse cx="100" cy="100" rx="20" ry="80" fill="none" stroke="#4a90ff" stroke-opacity="0.25"/>
+        </svg>
+      </div>
+      <h1>welcome to <span class="grad">parallel-scraper</span></h1>
+      <p class="muted">
+        Google Places API placeId discovery + deep metadata scraping.<br>
+        every run lives on disk as CSVs. Phase 1 uses the same Text Search API flow as the Flask grid scraper.
+      </p>
+      <div class="welcome-actions">
+        <a href="#/new" class="btn-grad">▷ start new run</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── VIEW: NEW RUN ─────────────────────────────── -->
+  <section class="view view-newrun" data-view="newrun" hidden>
+    <div class="newrun-shell">
+
+      <aside class="newrun-config">
+        <header class="config-header">
+          <h2>new run configuration</h2>
+          <p class="muted small" id="newrun-stage-label">stage 1 · area selection</p>
+        </header>
+
+        <!-- STAGE 1: AREA -->
+        <section class="config-stage" data-stage="1">
+          <h6 class="section-h">area selection</h6>
+          <div class="tabs" role="tablist">
+            <button class="tab" data-tab="city" aria-selected="true">city search</button>
+            <button class="tab" data-tab="osm">OSM ID</button>
+            <button class="tab" data-tab="draw">draw area</button>
+          </div>
+
+          <!-- tab: city -->
+          <div class="tab-panel" data-panel="city">
+            <div class="row">
+              <input type="text" id="city-query" placeholder="enter city name (e.g. Mumbai, Maharashtra, India)">
+              <button type="button" id="city-search-btn">search</button>
+            </div>
+            <ul class="candidates" id="city-candidates" hidden></ul>
+          </div>
+
+          <!-- tab: osm -->
+          <div class="tab-panel" data-panel="osm" hidden>
+            <div class="row">
+              <input type="number" id="osm-id-input" placeholder="13312356">
+              <select id="osm-type-input">
+                <option value="relation" selected>relation</option>
+                <option value="way">way</option>
+                <option value="node">node</option>
+              </select>
+              <button type="button" id="osm-load-btn">load</button>
+            </div>
+          </div>
+
+          <!-- tab: draw -->
+          <div class="tab-panel" data-panel="draw" hidden>
+            <div class="row">
+              <input type="text" id="polygon-name" placeholder="area name (e.g. Bandra West)">
+              <button type="button" id="polygon-draw-btn">draw on map ↗</button>
+              <button type="button" class="outline" id="polygon-clear-btn" hidden>clear</button>
+            </div>
+            <p class="muted small">draw a polygon or rectangle on the map →</p>
+          </div>
+
+          <h6 class="section-h sp-top">grid setup</h6>
+          <div class="grid-controls">
+            <div class="grid-size">
+              <label>grid size (m)</label>
+              <div class="row sized">
+                <input type="range" id="grid-size-range" min="200" max="5000" step="100" value="1000">
+                <input type="number" id="grid-size-num" min="100" max="20000" step="100" value="1000">
+                <span class="muted small">m</span>
+              </div>
+            </div>
+
+            <div class="grid-type">
+              <label>grid type</label>
+              <div class="seg">
+                <button type="button" class="seg-btn active" data-grid-type="square">▦ square</button>
+                <button type="button" class="seg-btn" data-grid-type="hex" disabled title="hex coming soon">⬡ hexagonal</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="status-strip">
+            <span id="step1-status" class="muted small">no area selected</span>
+            <span id="grid-info" class="muted small mono"></span>
+          </div>
+
+          <button type="button" class="btn-grad full" id="next-stage-btn" disabled>next stage →</button>
+        </section>
+
+        <!-- STAGE 2: SEARCH/RUN CONFIG -->
+        <section class="config-stage" data-stage="2" hidden>
+          <h6 class="section-h">search queries</h6>
+          <div class="presets-row">
+            <select id="preset-select">
+              <option value="">— select a preset —</option>
+            </select>
+            <button type="button" class="outline small" id="preset-load-btn" disabled>load</button>
+            <input type="text" id="preset-name" placeholder="preset name">
+            <button type="button" class="outline small" id="preset-save-btn">save as</button>
+            <button type="button" class="outline small danger" id="preset-delete-btn" disabled>del</button>
+          </div>
+
+          <div class="queries" id="queries-list">
+            <!-- query rows injected here -->
+          </div>
+          <button type="button" class="ghost small" id="add-query-btn">+ add query</button>
+
+          <h6 class="section-h sp-top">workers</h6>
+          <div class="workers-grid">
+            <div>
+              <label>phase 1 — discovery</label>
+              <div class="row sized">
+                <input type="range" id="phase1-range" min="1" max="10" step="1" value="3">
+                <input type="number" id="phase1-num" min="1" max="20" value="3">
+              </div>
+              <p class="muted small">concurrent Maps-search Chromium contexts.</p>
+            </div>
+            <div>
+              <label>phase 2 — deep scrape</label>
+              <div class="row sized">
+                <input type="range" id="phase2-range" min="1" max="20" step="1" value="5">
+                <input type="number" id="phase2-num" min="1" max="20" value="5">
+              </div>
+              <p class="muted small">parallel deep-scrape Chromium browsers (~100 MB each).</p>
+            </div>
+          </div>
+
+          <h6 class="section-h sp-top">columns to save</h6>
+          <div class="row">
+            <select id="profile-select">
+              <option value="lean" selected>lean</option>
+              <option value="rich">rich</option>
+              <option value="reviews-only">reviews-only</option>
+              <option value="default">default</option>
+              <option value="">(custom)</option>
+            </select>
+            <span class="muted small" id="cols-summary">10 columns</span>
+          </div>
+          <details class="cols-details">
+            <summary>view / edit column list</summary>
+            <div class="chips" id="column-checkboxes"></div>
+          </details>
+
+          <h6 class="section-h sp-top">other</h6>
+          <label class="row gap-sm">
+            <input type="checkbox" id="dry-run">
+            <span class="small">dry run (mock both phases — no live network)</span>
+          </label>
+          <label class="row sized">
+            <span class="small w-100">max places</span>
+            <input type="number" id="max-places" placeholder="(no cap)">
+          </label>
+
+          <div class="stage-actions">
+            <button type="button" class="outline" id="back-stage-btn">← back</button>
+            <button type="button" class="btn-grad" id="start-run-btn">▷ start run</button>
+          </div>
+        </section>
+      </aside>
+
+      <!-- right: full-bleed map preview -->
+      <div class="newrun-map-pane">
+        <div id="newrun-map" class="bigmap"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── VIEW: MONITOR ─────────────────────────────── -->
+  <section class="view view-monitor" data-view="monitor" hidden>
+    <header class="monitor-header">
+      <div class="mh-left">
+        <h2><span class="grad">monitoring</span> dashboard</h2>
+        <span class="muted small mh-sub" id="m-subtitle">—</span>
+      </div>
+      <div class="mh-right">
+        <span class="kv"><span class="k">run id</span><span class="v mono" id="m-runid">—</span></span>
+        <span class="kv"><span class="k">area</span><span class="v" id="m-area">—</span></span>
+        <span class="status-pill" data-state="idle" id="m-status">
+          <span class="dot"></span> <span class="status-label">idle</span>
+        </span>
+        <button class="outline" id="m-stop-btn" data-variant="danger" hidden>■ stop</button>
+        <button class="outline" id="m-resume-btn" hidden>↻ resume</button>
+      </div>
+    </header>
+
+    <div class="monitor-grid">
+      <div class="card map-card">
+        <div class="card-head">
+          <h6>live grid</h6>
+          <div class="map-legend">
+            <span class="lg lg-pending">pending</span>
+            <span class="lg lg-progress">in progress</span>
+            <span class="lg lg-done">done</span>
+            <span class="lg lg-failed">failed</span>
+          </div>
+        </div>
+        <div id="monitor-map" class="bigmap"></div>
+      </div>
+
+      <div class="card stats-card">
+        <div class="card-head"><h6>live counters</h6></div>
+        <div class="stat-grid">
+          <div class="stat" data-tone="info">
+            <div class="stat-icon">↗</div>
+            <dt>discovered</dt>
+            <dd id="s-discovered">0</dd>
+          </div>
+          <div class="stat" data-tone="success">
+            <div class="stat-icon">✓</div>
+            <dt>scraped</dt>
+            <dd id="s-scraped">0</dd>
+          </div>
+          <div class="stat" data-tone="warn">
+            <div class="stat-icon">⚠</div>
+            <dt>queue</dt>
+            <dd id="s-queue">0</dd>
+          </div>
+          <div class="stat" data-tone="danger">
+            <div class="stat-icon">⊘</div>
+            <dt>errors</dt>
+            <dd id="s-errors">0</dd>
+          </div>
+          <div class="stat">
+            <div class="stat-icon">∿</div>
+            <dt>rps</dt>
+            <dd id="s-rps">0.00</dd>
+          </div>
+          <div class="stat">
+            <div class="stat-icon">◷</div>
+            <dt>elapsed</dt>
+            <dd id="s-elapsed">0s</dd>
+          </div>
+        </div>
+
+        <div class="progress-block">
+          <div class="progress-row">
+            <label>cells processed</label>
+            <span class="progress-text" id="p-cells-text">0 / 0</span>
+            <div class="bar"><div class="fill" id="p-cells-fill" style="width:0%"></div></div>
+          </div>
+          <div class="progress-row">
+            <label>placeIds scraped</label>
+            <span class="progress-text" id="p-pids-text">0 / 0</span>
+            <div class="bar"><div class="fill" id="p-pids-fill" style="width:0%"></div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card log-card">
+        <div class="card-head">
+          <h6>live log tail</h6>
+          <span class="muted small" id="log-status">tailing run.log</span>
+        </div>
+        <div class="log-table-wrap">
+          <table class="log-table">
+            <thead>
+              <tr><th>timestamp</th><th>level</th><th>message</th><th>cell id</th></tr>
+            </thead>
+            <tbody id="log-tbody">
+              <tr><td colspan="4" class="muted">(waiting…)</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card files-card">
+        <div class="card-head"><h6>output files</h6></div>
+        <ul class="files-list" id="m-files"></ul>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+</body>
+</html>

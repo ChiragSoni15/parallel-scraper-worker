@@ -1,0 +1,21 @@
+# Never commit credentials, client data, or run outputs to this PUBLIC repo.
+.env
+.env.*
+*.pem
+*.pfx
+*.p12
+**/credentials/
+**/gdrive_token*.json
+**/service_account*.json
+inputs/
+outputs/
+inputs/api_keys*
+**/api_key_usage*.json
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/

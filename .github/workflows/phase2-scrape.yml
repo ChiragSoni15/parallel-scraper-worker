@@ -1,0 +1,93 @@
+name: phase2-scrape
+
+# PUBLIC Phase 2 deep-scrape worker. Holds NO DB/Drive creds — only:
+#   secret  WORKER_TOKEN     (bearer for the lease/submit API on the VM)
+#   var     WORKER_API_BASE  (https URL of the API, e.g. the Cloudflare tunnel)
+# The worker leases placeIds from / submits results to that API; it never
+# touches Azure SQL or Google Drive.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:      { required: true,  type: string }
+      shards:      { required: false, type: string, default: "12" }
+      max_minutes: { required: false, type: string, default: "300" }
+
+concurrency:
+  group: phase2-${{ inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  # Fail fast if a credential file or private-only module ever lands here.
+  guard:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Secret / forbidden-path guard
+        run: bash scripts/check_no_secrets.sh
+
+  # DB-free planner: ask the API how many placeIds remain; build a shard matrix.
+  plan:
+    needs: guard
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+      pending: ${{ steps.mk.outputs.pending }}
+    steps:
+      - id: mk
+        env:
+          WORKER_API_BASE: ${{ vars.WORKER_API_BASE }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          RUN_ID: ${{ inputs.run_id }}
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WORKER_API_BASE:-}" ] || [ -z "${WORKER_TOKEN:-}" ]; then
+            echo "WORKER_API_BASE (var) and WORKER_TOKEN (secret) must be set on this repo." >&2
+            exit 1
+          fi
+          base="${WORKER_API_BASE%/}"
+          shards=$(( SHARDS < 1 ? 1 : (SHARDS > 20 ? 20 : SHARDS) ))
+          prog=$(curl -fsS -H "Authorization: Bearer ${WORKER_TOKEN}" \
+                   "${base}/phase2/progress?run_id=${RUN_ID}")
+          echo "progress: ${prog}"
+          pending=$(echo "$prog" | jq '((.queued // 0) + (.failed // 0))')
+          if [ "$pending" -eq 0 ]; then
+            matrix='[]'
+          else
+            matrix=$(jq -nc --argjson n "$shards" '[range(0;$n)]')
+          fi
+          echo "pending=$pending" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix"   >> "$GITHUB_OUTPUT"
+          echo "plan.phase2 run_id=${RUN_ID} pending=${pending} shards=${shards} matrix=${matrix}"
+
+  scrape:
+    needs: plan
+    if: ${{ needs.plan.outputs.pending != '0' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps (Playwright only — NO DB driver, NO Drive)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          python -m playwright install --with-deps chromium
+      - name: Scrape (API mode)
+        env:
+          WORKER_API_BASE: ${{ vars.WORKER_API_BASE }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          PHASE2_CAPTURE_SCREENSHOTS: "0"   # metadata + CDN URLs only; no Drive on public compute
+        run: >
+          python -m cloud.phase2_worker_api
+          --run-id "${{ inputs.run_id }}"
+          --shard "${{ matrix.shard }}"
+          --max-minutes "${{ inputs.max_minutes }}"

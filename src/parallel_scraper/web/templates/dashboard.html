@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>parallel-scraper</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="/static/leaflet/leaflet.css">
+<link rel="stylesheet" href="/static/leaflet/leaflet.draw.css">
+<link rel="stylesheet" href="/static/app/styles.css?v=zoom-controls-1"/>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- Leaflet (vendored locally) -->
+<script src="/static/leaflet/leaflet.js"></script>
+<script src="/static/leaflet/leaflet.draw.js"></script>
+
+<!-- React + Babel standalone (CDN; matches the design prototype) -->
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin="anonymous"></script>
+
+<!-- Application modules (order matters) -->
+<script type="text/babel" src="/static/app/tweaks-panel.jsx"></script>
+<script type="text/babel" src="/static/app/icons.jsx"></script>
+<script type="text/babel" src="/static/app/data.jsx?v=results-boundary-1"></script>
+<script type="text/babel" src="/static/app/map.jsx?v=large-grid-1"></script>
+<script type="text/babel" src="/static/app/screens/sidebar.jsx?v=phase1-ui-2"></script>
+<script type="text/babel" src="/static/app/screens/welcome.jsx?v=phase1-ui-2"></script>
+<script type="text/babel" src="/static/app/screens/newrun.jsx?v=quota-scheduler-1"></script>
+<script type="text/babel" src="/static/app/screens/liverun.jsx?v=log-delta-1"></script>
+<script type="text/babel" src="/static/app/screens/results.jsx?v=results-boundary-1"></script>
+<script type="text/babel" src="/static/app/app.jsx?v=phase1-ui-2"></script>
+</body>
+</html>
