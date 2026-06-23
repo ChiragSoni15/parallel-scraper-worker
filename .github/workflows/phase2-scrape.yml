@@ -34,6 +34,7 @@ jobs:
       matrix: ${{ steps.mk.outputs.matrix }}
       pending: ${{ steps.mk.outputs.pending }}
     steps:
+      - uses: actions/checkout@v4   # for worker_ca.pem (pinned self-signed cert), if present
       - id: mk
         env:
           WORKER_API_BASE: ${{ vars.WORKER_API_BASE }}
@@ -48,7 +49,11 @@ jobs:
           fi
           base="${WORKER_API_BASE%/}"
           shards=$(( SHARDS < 1 ? 1 : (SHARDS > 20 ? 20 : SHARDS) ))
-          prog=$(curl -fsS -H "Authorization: Bearer ${WORKER_TOKEN}" \
+          # If the API uses a pinned self-signed cert (Azure static IP, no domain),
+          # verify against it instead of the public CA set.
+          cacert=""
+          if [ -f "$GITHUB_WORKSPACE/worker_ca.pem" ]; then cacert="--cacert $GITHUB_WORKSPACE/worker_ca.pem"; fi
+          prog=$(curl -fsS $cacert -H "Authorization: Bearer ${WORKER_TOKEN}" \
                    "${base}/phase2/progress?run_id=${RUN_ID}")
           echo "progress: ${prog}"
           pending=$(echo "$prog" | jq '((.queued // 0) + (.failed // 0))')
@@ -73,6 +78,12 @@ jobs:
         shard: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+      - name: Pin VM self-signed cert if present
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/worker_ca.pem" ]; then
+            echo "WORKER_CA_BUNDLE=$GITHUB_WORKSPACE/worker_ca.pem" >> "$GITHUB_ENV"
+            echo "pinned VM cert -> WORKER_CA_BUNDLE"
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

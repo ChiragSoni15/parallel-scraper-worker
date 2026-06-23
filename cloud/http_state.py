@@ -20,6 +20,11 @@ class HttpState:
         self.timeout = timeout
         self._s = requests.Session()
         self._s.headers["Authorization"] = f"Bearer {self.token}"
+        # When the API uses a self-signed cert (e.g. Azure static IP, no domain), pin it:
+        # WORKER_CA_BUNDLE points at that public cert so TLS is verified, not disabled.
+        ca_bundle = os.environ.get("WORKER_CA_BUNDLE")
+        if ca_bundle:
+            self._s.verify = ca_bundle
 
     def _request(self, method: str, path: str, *, json=None, params=None):
         last = None
