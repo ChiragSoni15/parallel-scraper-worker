@@ -97,10 +97,13 @@ jobs:
         env:
           WORKER_API_BASE: ${{ vars.WORKER_API_BASE }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
-          # Capture page screenshots and POST the bytes to the API, which uploads to
-          # Drive. The public worker still holds NO Drive creds — only the API (on the VM)
-          # does. Screenshots are recorded under the same lease guard as results.
           PHASE2_CAPTURE_SCREENSHOTS: "1"
+          # ASYNC screenshots: instead of POSTing bytes to the API inline (the Drive upload
+          # is slow and was the throughput bottleneck), save PNGs + a manifest to this dir.
+          # The step below uploads it as a build artifact (a durable, off-runner queue); a
+          # separate paced drainer (cloud/drain_screenshots.py) uploads them to Drive later.
+          # So phase 2 only does lease/submit against the API and scales to many workers.
+          PHASE2_SHOT_DIR: ${{ github.workspace }}/_shots
           # placeIds scraped at once per shard (1 = sequential). Each adds a browser, so
           # it raises this runner's per-IP request rate — watch the failed/block rate.
           PHASE2_CONCURRENCY: "${{ inputs.concurrency }}"
@@ -110,3 +113,14 @@ jobs:
           --shard "${{ matrix.shard }}"
           --max-minutes "${{ inputs.max_minutes }}"
           --concurrency "${{ inputs.concurrency }}"
+
+      # The durable screenshot queue: each shard's captured PNGs + manifest.jsonl, uploaded
+      # off the ephemeral runner. Drained to Drive later by cloud/drain_screenshots.py.
+      - name: Upload screenshot artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ inputs.run_id }}-shard-${{ matrix.shard }}
+          path: ${{ github.workspace }}/_shots
+          if-no-files-found: ignore
+          retention-days: 7

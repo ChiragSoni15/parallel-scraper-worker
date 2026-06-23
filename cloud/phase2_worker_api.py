@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import tempfile
 import threading
 import time
@@ -25,6 +26,34 @@ from cloud.http_state import HttpState
 from cloud.phase2_common import P2Result, _default_session_factory, _split_image_urls
 
 logger = logging.getLogger(__name__)
+
+# Screenshot sink. Default: POST bytes to the API (which uploads to Drive inline).
+# When PHASE2_SHOT_DIR is set (the GitHub-Actions path), instead copy the PNGs there and
+# append a manifest line — the workflow then uploads that dir as a build artifact (a
+# durable, off-runner queue), and a separate paced drainer uploads them to Drive later.
+# This keeps the slow Drive upload OFF the scrape hot path so phase 2 scales.
+_SHOT_DIR = os.environ.get("PHASE2_SHOT_DIR") or None
+_SHOT_MANIFEST_LOCK = threading.Lock()
+
+
+def _sink_shots(state, run_id, pid, attempts, shots):
+    """Persist a place's screenshots — to the artifact dir if PHASE2_SHOT_DIR is set,
+    else upload via the API `state`. Best-effort; callers wrap in try/except."""
+    if not shots:
+        return
+    if _SHOT_DIR:
+        Path(_SHOT_DIR).mkdir(parents=True, exist_ok=True)
+        manifest = Path(_SHOT_DIR) / "manifest.jsonl"
+        for kind, src in shots.items():
+            fname = f"{pid}_{kind}.png"
+            shutil.copyfile(src, Path(_SHOT_DIR) / fname)
+            with _SHOT_MANIFEST_LOCK:
+                with open(manifest, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"run_id": run_id, "place_id": pid,
+                                        "kind": kind, "attempts": attempts,
+                                        "file": fname}) + "\n")
+    else:
+        state.upload_screenshots(run_id, pid, attempts, shots)
 
 
 def _resolve_concurrency(concurrency) -> int:
@@ -120,10 +149,9 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
                         try:
                             shots = (session.screenshot_paths(pid)
                                      if hasattr(session, "screenshot_paths") else {})
-                            if shots:
-                                state.upload_screenshots(run_id, pid, attempts, shots)
+                            _sink_shots(state, run_id, pid, attempts, shots)
                         except Exception:
-                            logger.warning("phase2.shot_upload_failed run_id=%s pid=%s",
+                            logger.warning("phase2.shot_sink_failed run_id=%s pid=%s",
                                            run_id, pid, exc_info=True)
                 except Exception as exc:
                     logger.warning("phase2.place_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
@@ -164,10 +192,9 @@ def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state):
             try:
                 shots = (session.screenshot_paths(pid)
                          if hasattr(session, "screenshot_paths") else {})
-                if shots:
-                    shot_state.upload_screenshots(run_id, pid, attempts, shots)
+                _sink_shots(shot_state, run_id, pid, attempts, shots)
             except Exception:
-                logger.warning("phase2.shot_upload_failed run_id=%s pid=%s",
+                logger.warning("phase2.shot_sink_failed run_id=%s pid=%s",
                                run_id, pid, exc_info=True)
         return done, None
     except Exception as exc:
