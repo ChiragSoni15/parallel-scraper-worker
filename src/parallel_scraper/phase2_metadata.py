@@ -503,6 +503,29 @@ class PlaywrightSession:
         self.places_scraped += 1
         return captured[0] if captured else None
 
+    def horeca_capture(self, place_id: str, photo_cap: int | None = None) -> Optional[dict]:
+        """HoReCa menu/photo/date/imagery capture on the CURRENT page — call
+        right after scrape(place_id) while the panel is still open. Gated by
+        env PHASE2_HORECA=1; returns the capture dict or None when off/dead.
+        Never raises (capture_horeca degrades per-section)."""
+        import os as _os
+        if _os.environ.get("PHASE2_HORECA", "0") != "1":
+            return None
+        if not self._page_alive():
+            return None
+        from parallel_scraper.horeca_capture import PHOTO_CAP_DEFAULT, capture_horeca
+        cap = int(photo_cap or _os.environ.get("PHASE2_HORECA_PHOTO_CAP", PHOTO_CAP_DEFAULT))
+
+        async def _do() -> dict:
+            return await capture_horeca(self._page, photo_cap=cap)
+
+        try:
+            return self._loop.run_until_complete(_do())
+        except Exception:
+            logger.warning("phase2_session.horeca_capture_failed place_id=%s",
+                           place_id, exc_info=True)
+            return None
+
     def screenshot_paths(self, place_id: str) -> dict:
         """Return {kind: png_path} for the panel screenshots captured for this place
         (empty if capture is off or nothing was written). Used by the API-mode worker

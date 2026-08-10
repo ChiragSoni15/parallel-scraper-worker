@@ -60,6 +60,7 @@ def consumer_loop(
                 csv_path, failures_path,
                 delay_ms=config.consumer_delay_ms,
                 full_relaunch_every=config.worker_full_relaunch_every,
+                capture_screenshots=config.capture_screenshots,
             )
             logger.info("consumer.session_open id=%d recycle_after=%d",
                         consumer_id, recycle_after)
@@ -179,7 +180,7 @@ def _scrape_and_persist(
     # doesn't gate the next place; falls back to inline if the pool is absent or
     # its backlog is full.
     image_urls = (row or {}).get("image_urls") if not config.dry_run else None
-    if image_urls and image_urls != "N/A":
+    if config.download_images and image_urls and image_urls != "N/A":
         pid_for_images = row.get("place_id", "") or place_id
         if image_pool is not None:
             # Hand off to the background pool; if its backlog is full, download

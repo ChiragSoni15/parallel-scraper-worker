@@ -54,6 +54,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--worker-browser-recycle-after", type=int, default=50,
                    help="Restart each Phase-2 Chromium after this many places "
                         "to bound memory growth (default 50, min 1).")
+    p.add_argument("--no-image-download", action="store_true",
+                   help="Metadata only: skip downloading image files to disk. "
+                        "image_urls (Google CDN links) are still captured in the CSV.")
+    p.add_argument("--capture-screenshots", action="store_true",
+                   help="Save per-place panel screenshots (overview + reviews/histogram) "
+                        "to outputs/<run>/screenshots/ for multimodal-LLM review.")
     p.add_argument("--master-dedup", default="inputs/known_placeids.csv",
                    dest="master_dedup_csv")
     p.add_argument("--output-dir", default="outputs")
@@ -63,7 +69,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true",
                    help="Mock both phases — no live network")
     p.add_argument("--polygon-file", default=None,
-                   help="Path to a JSON file with [[lat,lng],...] polygon coords. "
+                   help="Path to a JSON file with [[lat,lng],...] polygon coords, or "
+                        "GeoJSON (Polygon/MultiPolygon/Feature/FeatureCollection). "
                         "When set, takes precedence over --osm-id.")
     p.add_argument("--columns", default=None,
                    help="Comma-separated column keys to save (skip the picker)")
@@ -197,8 +204,15 @@ def main(argv: list[str] | None = None) -> int:
 
     polygon = None
     if args.polygon_file:
-        coords = json.loads(Path(args.polygon_file).read_text(encoding="utf-8"))
-        polygon = tuple((float(lat), float(lng)) for lat, lng in coords)
+        from parallel_scraper.boundary import polygon_rings_from_geojson
+        data = json.loads(Path(args.polygon_file).read_text(encoding="utf-8"))
+        rings = polygon_rings_from_geojson(data)
+        # Single ring keeps the legacy flat shape (round-trips through existing
+        # run_config.json files); multiple rings nest one level deeper.
+        if len(rings) == 1:
+            polygon = tuple((lat, lng) for lat, lng in rings[0])
+        else:
+            polygon = tuple(tuple((lat, lng) for lat, lng in r) for r in rings)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -247,6 +261,8 @@ def main(argv: list[str] | None = None) -> int:
         run_id=args.run_id,
         max_places=args.max_places,
         dry_run=args.dry_run,
+        download_images=not args.no_image_download,
+        capture_screenshots=args.capture_screenshots,
         boundary_polygon=polygon,
     )
 

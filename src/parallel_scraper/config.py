@@ -105,11 +105,23 @@ class ParallelConfig:
     # Bounded backlog for the image pool. When full, the consumer downloads
     # inline (best-effort) so images are never dropped and memory can't grow.
     image_queue_maxsize: int = 512
+    # When False, skip downloading image files to disk entirely. The image_urls
+    # (Google CDN links) are STILL captured in the metadata CSV — only the byte
+    # downloads are skipped. Used for metadata-only client deliveries.
+    download_images: bool = True
+    # When True, save panel-element screenshots per place to
+    # outputs/<run>/screenshots/<place_id>_{overview,reviews}.png. The scrape
+    # already drives the page to the Reviews tab (Sort=Newest), so capture is
+    # cheap. Intended as multimodal-LLM review input (rating histogram + newest
+    # reviews + storefront panel) alongside the scraped image_urls.
+    capture_screenshots: bool = False
     discovery_max_scroll: int = 8
     discovery_scroll_settle_ms: int = 800
     # When set, takes precedence over osm_relation_id for boundary lookup.
-    # Coords are [(lat, lng), ...] of the polygon's outer ring.
-    boundary_polygon: Optional[tuple[tuple[float, float], ...]] = None
+    # Coords are [(lat, lng), ...] of the polygon's outer ring, OR a tuple of
+    # such rings for a MultiPolygon coverage area (boundary_from_polygon accepts
+    # both shapes; multiple rings are unioned for grid generation).
+    boundary_polygon: Optional[tuple] = None
 
     def output_columns(self) -> tuple[str, ...]:
         """Final column list for phase2_data.csv: place_id first, then operator selection."""

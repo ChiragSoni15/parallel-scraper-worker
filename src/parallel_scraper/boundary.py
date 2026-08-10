@@ -108,23 +108,80 @@ def fetch_boundary(osm_id: int, osm_type: str = "relation"):
     return gdf
 
 
-def boundary_from_polygon(coords: Sequence[tuple[float, float]]):
-    """Build a GeoDataFrame from operator-drawn polygon coordinates [(lat, lng), ...]."""
+def _is_ring(coords) -> bool:
+    """True when coords looks like a single ring [(lat, lng), ...] rather than a
+    list of rings [[(lat, lng), ...], ...]."""
+    first = coords[0]
+    return isinstance(first[0], (int, float))
+
+
+def polygon_rings_from_geojson(data) -> list[list[tuple[float, float]]]:
+    """Normalize a polygon source to a list of outer rings in (lat, lng) order.
+
+    Accepts: a bare coordinate list [[lat, lng], ...], a bare list of such rings,
+    or GeoJSON — Polygon, MultiPolygon, Feature, FeatureCollection (all features'
+    Polygon/MultiPolygon geometries are collected). Holes are ignored (grid cells
+    over a hole cost a few extra $0 discovery calls, same as the OSM path).
+    GeoJSON coordinates are (lon, lat) and get swapped; bare lists are (lat, lng).
+    """
+    if isinstance(data, (list, tuple)):
+        if not data:
+            raise ValueError("empty polygon coordinates")
+        if _is_ring(data):
+            return [[(float(lat), float(lng)) for lat, lng in data]]
+        return [[(float(lat), float(lng)) for lat, lng in ring] for ring in data]
+
+    if not isinstance(data, dict):
+        raise ValueError("polygon source must be a coordinate list or GeoJSON object")
+
+    gtype = data.get("type")
+    if gtype == "FeatureCollection":
+        rings: list[list[tuple[float, float]]] = []
+        for feat in data.get("features", []):
+            rings.extend(polygon_rings_from_geojson(feat))
+        if not rings:
+            raise ValueError("FeatureCollection contains no Polygon/MultiPolygon features")
+        return rings
+    if gtype == "Feature":
+        return polygon_rings_from_geojson(data.get("geometry") or {})
+    if gtype == "Polygon":
+        outer = data["coordinates"][0]
+        return [[(float(lat), float(lng)) for lng, lat in outer]]
+    if gtype == "MultiPolygon":
+        return [[(float(lat), float(lng)) for lng, lat in poly[0]]
+                for poly in data["coordinates"]]
+    raise ValueError(f"unsupported GeoJSON type for a boundary: {gtype!r}")
+
+
+def boundary_from_polygon(coords):
+    """Build a GeoDataFrame from operator-supplied polygon coordinates.
+
+    Accepts a single ring [(lat, lng), ...] (legacy shape) or a list of rings
+    [[(lat, lng), ...], ...] (e.g. from a MultiPolygon coverage boundary); multiple
+    rings are unioned so grid generation covers every part."""
     try:
         import geopandas as gpd
         from shapely.geometry import Polygon
+        from shapely.ops import unary_union
     except ImportError as e:
         raise RuntimeError(f"geopandas/shapely required: {e}")
 
-    if len(coords) < 3:
+    if len(coords) == 0:
         raise ValueError("polygon needs at least 3 points")
-    # Shapely uses (lon, lat) order.
-    poly = Polygon([(lng, lat) for lat, lng in coords])
-    if not poly.is_valid:
-        poly = poly.buffer(0)
+    rings = [coords] if _is_ring(coords) else list(coords)
+    polys = []
+    for ring in rings:
+        if len(ring) < 3:
+            raise ValueError("polygon needs at least 3 points")
+        # Shapely uses (lon, lat) order.
+        poly = Polygon([(lng, lat) for lat, lng in ring])
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        polys.append(poly)
+    geom = polys[0] if len(polys) == 1 else unary_union(polys)
     gdf = gpd.GeoDataFrame(
         {"display_name": ["custom_polygon"]},
-        geometry=[poly],
+        geometry=[geom],
         crs="EPSG:4326",
     )
     return gdf

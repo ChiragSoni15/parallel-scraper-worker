@@ -96,6 +96,7 @@ class ParallelScraper:
         self._image_pool: Optional[ImageDownloadPool] = None
         self._image_marker: Optional[BufferedCsvWriter] = None
         if (not config.dry_run and not self._phase2_disabled
+                and config.download_images
                 and config.image_download_workers > 0):
             marker_path = self._run_dir / "images_state.csv"
             seed_needed = not marker_path.exists()

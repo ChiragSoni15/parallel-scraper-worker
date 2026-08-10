@@ -44,6 +44,7 @@ const Icons = {
   ArrowRight: (p) => <Ic d="M3 8h10 M9 4l4 4-4 4" {...p} />,
   Filter: (p) => <Ic d="M2 3h12l-4.5 6v4l-3 1.5V9z" {...p} />,
   Download: (p) => <Ic d="M8 1.5v9 M4 7.5l4 4 4-4 M2 14h12" {...p} />,
+  Upload: (p) => <Ic d="M8 11.5v-9 M4 5.5l4-4 4 4 M2 14h12" {...p} />,
   Settings: (p) => <Ic d={<><circle cx="8" cy="8" r="2"/><path d="M8 1.5v2 M8 12.5v2 M14.5 8h-2 M3.5 8h-2 M12.6 3.4l-1.4 1.4 M4.8 11.2l-1.4 1.4 M12.6 12.6l-1.4-1.4 M4.8 4.8L3.4 3.4"/></>} {...p} />,
   Clock: (p) => <Ic d={<><circle cx="8" cy="8" r="6"/><path d="M8 5v3l2 2"/></>} {...p} />,
   Activity: (p) => <Ic d="M1 8h3l2-5 4 10 2-5h3" {...p} />,

@@ -13,9 +13,17 @@ on:
       shards:      { required: false, type: string, default: "12" }
       max_minutes: { required: false, type: string, default: "300" }
       concurrency: { required: false, type: string, default: "3" }   # placeIds scraped at once PER shard (1-5)
+      horeca:      { required: false, type: string, default: "0" }   # 1 = menu/photo/date capture per place
+  # Self-drain: while repo var ACTIVE_RUN_ID is set, re-dispatch every 30 min.
+  # The plan job exits free when the queue is empty; the concurrency group
+  # below prevents overlap with a still-running dispatch. Clear ACTIVE_RUN_ID
+  # (or let the queue drain) to stop.
+  schedule:
+    - cron: "*/30 * * * *"
 
+# Scheduled runs have no inputs -> fall back to repo variables.
 concurrency:
-  group: phase2-${{ inputs.run_id }}
+  group: phase2-${{ inputs.run_id || vars.ACTIVE_RUN_ID || 'none' }}
   cancel-in-progress: false
 
 jobs:
@@ -40,10 +48,17 @@ jobs:
         env:
           WORKER_API_BASE: ${{ vars.WORKER_API_BASE }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
-          RUN_ID: ${{ inputs.run_id }}
-          SHARDS: ${{ inputs.shards }}
+          RUN_ID: ${{ inputs.run_id || vars.ACTIVE_RUN_ID }}
+          SHARDS: ${{ inputs.shards || vars.ACTIVE_SHARDS || '20' }}
         run: |
           set -euo pipefail
+          if [ -z "${RUN_ID:-}" ]; then
+            # cron tick with no active run configured — exit free with no shards
+            echo "no run_id (input or ACTIVE_RUN_ID var) — nothing to do"
+            echo "pending=0" >> "$GITHUB_OUTPUT"
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ -z "${WORKER_API_BASE:-}" ] || [ -z "${WORKER_TOKEN:-}" ]; then
             echo "WORKER_API_BASE (var) and WORKER_TOKEN (secret) must be set on this repo." >&2
             exit 1
@@ -98,21 +113,32 @@ jobs:
           WORKER_API_BASE: ${{ vars.WORKER_API_BASE }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
           PHASE2_CAPTURE_SCREENSHOTS: "1"
-          # ASYNC screenshots: instead of POSTing bytes to the API inline (the Drive upload
-          # is slow and was the throughput bottleneck), save PNGs + a manifest to this dir.
-          # The step below uploads it as a build artifact (a durable, off-runner queue); a
-          # separate paced drainer (cloud/drain_screenshots.py) uploads them to Drive later.
-          # So phase 2 only does lease/submit against the API and scales to many workers.
+          # ASYNC screenshots, preferred path: PUT each PNG straight to an Azure Blob
+          # staging container (write-only container SAS — no account key, no read/list).
+          # The private drainer (cloud/drain_screenshots_blob.py) empties it to Drive
+          # CONTINUOUSLY, even while shards are still scraping. Unset → artifact fallback.
+          PHASE2_SHOT_BLOB_SAS: ${{ secrets.PHASE2_SHOT_BLOB_SAS }}
+          # Mirror each place's photos (Google CDN -> Blob) under <run_id>/<place_id>/.
+          # Best-effort; "0" disables. Cap keeps per-place time bounded.
+          PHASE2_PHOTOS_TO_BLOB: "1"
+          PHASE2_PHOTOS_MAX: "15"
+          # Fallback staging (also catches individual failed blob PUTs): save PNGs + a
+          # manifest to this dir; the step below uploads it as a build artifact, drained
+          # later by cloud/drain_screenshots.py. When every PUT lands in Blob the dir
+          # stays empty and no artifact is produced (if-no-files-found: ignore).
           PHASE2_SHOT_DIR: ${{ github.workspace }}/_shots
           # placeIds scraped at once per shard (1 = sequential). Each adds a browser, so
           # it raises this runner's per-IP request rate — watch the failed/block rate.
-          PHASE2_CONCURRENCY: "${{ inputs.concurrency }}"
+          PHASE2_CONCURRENCY: "${{ inputs.concurrency || vars.ACTIVE_CONCURRENCY || '3' }}"
+          # HoReCa capture: menu photos + posted dates + place-photo dates +
+          # imagery class, embedded in the data JSON; menu cards -> Blob.
+          PHASE2_HORECA: "${{ inputs.horeca || vars.ACTIVE_HORECA || '0' }}"
         run: >
           python -m cloud.phase2_worker_api
-          --run-id "${{ inputs.run_id }}"
+          --run-id "${{ inputs.run_id || vars.ACTIVE_RUN_ID }}"
           --shard "${{ matrix.shard }}"
-          --max-minutes "${{ inputs.max_minutes }}"
-          --concurrency "${{ inputs.concurrency }}"
+          --max-minutes "${{ inputs.max_minutes || '300' }}"
+          --concurrency "${{ inputs.concurrency || vars.ACTIVE_CONCURRENCY || '3' }}"
 
       # The durable screenshot queue: each shard's captured PNGs + manifest.jsonl, uploaded
       # off the ephemeral runner. Drained to Drive later by cloud/drain_screenshots.py.
@@ -120,7 +146,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots-${{ inputs.run_id }}-shard-${{ matrix.shard }}
+          name: screenshots-${{ inputs.run_id || vars.ACTIVE_RUN_ID }}-shard-${{ matrix.shard }}
           path: ${{ github.workspace }}/_shots
           if-no-files-found: ignore
           retention-days: 7

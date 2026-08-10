@@ -22,6 +22,10 @@ const NewRun = ({ setRoute, mapStyle }) => {
   const [drawCustomPolygon, setDrawCustomPolygon] = useStateNR(null);
   const [drawAreaName, setDrawAreaName] = useStateNR("");
 
+  // upload (GeoJSON file)
+  const [uploadAreaName, setUploadAreaName] = useStateNR("");
+  const [uploadFileName, setUploadFileName] = useStateNR("");
+
   // grid config
   const [gridSize, setGridSize] = useStateNR(1000);
   const [gridShape, setGridShape] = useStateNR("square");
@@ -56,6 +60,9 @@ const NewRun = ({ setRoute, mapStyle }) => {
   const [showColumnsPicker, setShowColumnsPicker] = useStateNR(false);
   const [dryRun, setDryRun] = useStateNR(false);
   const [maxPlaces, setMaxPlaces] = useStateNR("");
+  const [noImages, setNoImages] = useStateNR(false);
+  const [captureShots, setCaptureShots] = useStateNR(false);
+  const [phase1Only, setPhase1Only] = useStateNR(false);
   const [starting, setStarting] = useStateNR(false);
   // Custom run name. Empty -> server generates par_YYYYMMDD_HHMMSS_xxxxxx.
   // Otherwise user-supplied; sanitized to filesystem-safe chars on send.
@@ -188,6 +195,43 @@ const NewRun = ({ setRoute, mapStyle }) => {
     finally { setGridLoading(false); }
   }
 
+  // GeoJSON -> [[lat,lng],...] rings (JS mirror of boundary.polygon_rings_from_geojson).
+  // Accepts Polygon / MultiPolygon / Feature / FeatureCollection; outer rings only.
+  // GeoJSON coords are (lon, lat) — swapped here to the wizard's (lat, lng).
+  function ringsFromGeoJSON(data) {
+    const swap = ring => ring.map(([lng, lat]) => [Number(lat), Number(lng)]);
+    if (!data || typeof data !== "object") throw new Error("not a GeoJSON object");
+    if (data.type === "FeatureCollection") {
+      const rings = (data.features || []).flatMap(f => ringsFromGeoJSON(f));
+      if (!rings.length) throw new Error("no Polygon/MultiPolygon features found");
+      return rings;
+    }
+    if (data.type === "Feature") return ringsFromGeoJSON(data.geometry || {});
+    if (data.type === "Polygon") return [swap(data.coordinates[0])];
+    if (data.type === "MultiPolygon") return data.coordinates.map(poly => swap(poly[0]));
+    throw new Error(`unsupported GeoJSON type: ${data.type}`);
+  }
+
+  function onGeojsonFile(file) {
+    if (!file) return;
+    setUploadFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const rings = ringsFromGeoJSON(JSON.parse(reader.result));
+        // Single ring goes flat (legacy shape); multiple rings nest (MultiPolygon).
+        const coords = rings.length === 1 ? rings[0] : rings;
+        const name = uploadAreaName || file.name.replace(/\.(geo)?json$/i, "");
+        void resolveAreaFromPolygon(coords, name);
+      } catch (e) {
+        setGridError(`could not parse ${file.name}: ${e.message}`);
+        setAreaResolved(null);
+      }
+    };
+    reader.onerror = () => setGridError(`could not read ${file.name}`);
+    reader.readAsText(file);
+  }
+
   async function resolveAreaFromPolygon(coords, name, source = "polygon", extra = {}) {
     setGridLoading(true); setGridError(null);
     try {
@@ -267,9 +311,11 @@ const NewRun = ({ setRoute, mapStyle }) => {
       grid_size_meters: gridSize,
       queries: queriesStr,
       phase1_workers: workers1,
-      phase2_workers: workers2,
+      phase2_workers: phase1Only ? 0 : workers2,
       worker_browser_recycle_after: recycleAfter,
       dry_run: dryRun,
+      no_image_download: noImages,
+      capture_screenshots: captureShots,
     };
     if (sanitizedName) {
       body.run_id = sanitizedName;
@@ -346,6 +392,9 @@ const NewRun = ({ setRoute, mapStyle }) => {
                   <button aria-pressed={areaMode==="draw"}    onClick={()=>setAreaMode("draw")} style={{flex:1, justifyContent:"center"}}>
                     <I.Pen size={11}/> draw
                   </button>
+                  <button aria-pressed={areaMode==="upload"}  onClick={()=>setAreaMode("upload")} style={{flex:1, justifyContent:"center"}}>
+                    <I.Upload size={11}/> upload
+                  </button>
                 </div>
               </div>
 
@@ -398,6 +447,29 @@ const NewRun = ({ setRoute, mapStyle }) => {
                   <div className="field-row">
                     <input className="input" placeholder="area name (e.g. Bandra West)"
                            value={drawAreaName} onChange={e=>setDrawAreaName(e.target.value)}/>
+                  </div>
+                </div>
+              )}
+
+              {areaMode === "upload" && (
+                <div className="field">
+                  <p className="help">
+                    upload a GeoJSON boundary — Polygon, MultiPolygon, Feature or
+                    FeatureCollection (e.g. an H3-derived coverage boundary). MultiPolygons
+                    grid every part.
+                  </p>
+                  <div className="field-row">
+                    <input className="input" placeholder="area name (e.g. Orkla Bangalore)"
+                           value={uploadAreaName} onChange={e=>setUploadAreaName(e.target.value)}/>
+                  </div>
+                  <div className="field-row">
+                    <label className="btn" style={{cursor:"pointer"}}>
+                      <I.Upload size={11}/> choose .geojson
+                      <input type="file" accept=".geojson,.json,application/geo+json,application/json"
+                             style={{display:"none"}}
+                             onChange={e=>{ onGeojsonFile(e.target.files && e.target.files[0]); e.target.value = ""; }}/>
+                    </label>
+                    {uploadFileName && <span className="muted" style={{fontSize:11.5}}>{uploadFileName}</span>}
                   </div>
                 </div>
               )}
@@ -536,9 +608,9 @@ const NewRun = ({ setRoute, mapStyle }) => {
                       {apiStatus ? `: ${activeKeys} x ${PER_KEY_QPM}/min x ${Math.round(UTIL*100)}%` : ": loading keys"}.
                       Keys hitting 429 are auto-parked 30s and the rate rebalances.</p>
                   </div>
-                  <div>
+                  <div style={{opacity: phase1Only ? 0.45 : 1, pointerEvents: phase1Only ? "none" : "auto"}}>
                     <div style={{fontSize:11, color:"var(--accent)", fontFamily:"var(--font-mono)", marginBottom:6, textTransform:"uppercase", letterSpacing:0.06}}>
-                      phase 2 · deep scrape
+                      phase 2 · deep scrape {phase1Only && <span style={{color:"var(--fg-mute)", textTransform:"none", letterSpacing:0}}>· disabled (phase 1 only)</span>}
                     </div>
                     <div className="field-row">
                       <input type="range" className="slider" min={1} max={50} value={workers2} onChange={e=>setWorkers2(+e.target.value)}/>
@@ -606,6 +678,18 @@ const NewRun = ({ setRoute, mapStyle }) => {
                 <label className="check">
                   <input type="checkbox" checked={dryRun} onChange={e=>setDryRun(e.target.checked)}/>
                   dry run · mock both phases · no live network
+                </label>
+                <label className="check">
+                  <input type="checkbox" checked={noImages} onChange={e=>setNoImages(e.target.checked)}/>
+                  metadata only · skip image downloads · image_urls still saved
+                </label>
+                <label className="check">
+                  <input type="checkbox" checked={captureShots} onChange={e=>setCaptureShots(e.target.checked)}/>
+                  capture review screenshots · overview + ratings panel · for LLM review
+                </label>
+                <label className="check">
+                  <input type="checkbox" checked={phase1Only} onChange={e=>setPhase1Only(e.target.checked)}/>
+                  phase 1 only · discovery only · skip deep scrape (resumable later)
                 </label>
                 <div className="field-row" style={{marginTop:6}}>
                   <span className="muted" style={{width:90, fontSize:11.5}}>max places</span>

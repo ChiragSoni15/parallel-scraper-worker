@@ -78,9 +78,14 @@ class StartRunBody(BaseModel):
     columns: Optional[list[str]] = None
     master_dedup: str = "inputs/known_placeids.csv"
     dry_run: bool = False
+    # Metadata only: skip downloading image bytes to disk (image_urls still in CSV).
+    no_image_download: bool = False
+    # Save per-place panel screenshots (overview + reviews/histogram) for LLM review.
+    capture_screenshots: bool = False
     run_id: Optional[str] = None  # for resume
-    # Custom polygon: list of [lat, lng] pairs. When set, supersedes osm_id server-side.
-    custom_polygon: Optional[list[list[float]]] = None
+    # Custom polygon: list of [lat, lng] pairs, or a list of such rings for a
+    # MultiPolygon (uploaded GeoJSON). When set, supersedes osm_id server-side.
+    custom_polygon: Optional[list] = None
 
     def to_cli_args(self, output_dir: str, polygon_file: Optional[str] = None) -> list[str]:
         args = [
@@ -112,6 +117,10 @@ class StartRunBody(BaseModel):
             args += ["--columns", ",".join(self.columns)]
         else:
             args += ["--profile", "lean"]
+        if self.no_image_download:
+            args += ["--no-image-download"]
+        if self.capture_screenshots:
+            args += ["--capture-screenshots"]
         if self.run_id:
             args += ["--run-id", self.run_id]
         if self.dry_run:
@@ -126,7 +135,8 @@ class SearchCityBody(BaseModel):
 class GenerateGridBody(BaseModel):
     osm_id: Optional[int] = None
     osm_type: str = "relation"
-    custom_polygon: Optional[list[list[float]]] = None
+    # Single [lat, lng] ring or a list of rings (MultiPolygon upload).
+    custom_polygon: Optional[list] = None
     area_name: str = ""
     grid_size_meters: int = 1000
     grid_type: str = "square"
@@ -855,8 +865,8 @@ def create_app() -> FastAPI:
 
         if body.custom_polygon:
             try:
-                coords = [(float(lat), float(lng)) for lat, lng in body.custom_polygon]
-                boundary = boundary_from_polygon(coords)
+                # Flat ring or list of rings — boundary_from_polygon handles both.
+                boundary = boundary_from_polygon(body.custom_polygon)
             except Exception as e:
                 raise HTTPException(400, f"invalid polygon: {e}")
             display_name = body.area_name or "custom polygon"
@@ -1076,9 +1086,9 @@ def create_app() -> FastAPI:
         try:
             if custom_polygon_path.exists():
                 coords_raw = json.loads(custom_polygon_path.read_text(encoding="utf-8"))
-                # boundary_polygon.json stores [[lat, lng], ...]
-                coords = [(float(p[0]), float(p[1])) for p in coords_raw]
-                gdf = boundary_from_polygon(coords)
+                # boundary_polygon.json stores [[lat, lng], ...] or a list of
+                # such rings (MultiPolygon) — boundary_from_polygon handles both.
+                gdf = boundary_from_polygon(coords_raw)
             else:
                 osm_id = cfg.get("osm_relation_id")
                 osm_type = cfg.get("osm_type", "relation")

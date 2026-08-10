@@ -27,20 +27,37 @@ from cloud.phase2_common import P2Result, _default_session_factory, _split_image
 
 logger = logging.getLogger(__name__)
 
-# Screenshot sink. Default: POST bytes to the API (which uploads to Drive inline).
-# When PHASE2_SHOT_DIR is set (the GitHub-Actions path), instead copy the PNGs there and
-# append a manifest line — the workflow then uploads that dir as a build artifact (a
-# durable, off-runner queue), and a separate paced drainer uploads them to Drive later.
-# This keeps the slow Drive upload OFF the scrape hot path so phase 2 scales.
+# Screenshot sink, in priority order:
+#  1. PHASE2_SHOT_BLOB_SAS set → PUT each PNG to the Azure Blob staging container
+#     (durable queue the private drainer empties CONTINUOUSLY, even mid-run).
+#  2. PHASE2_SHOT_DIR set → copy PNGs + manifest line; the workflow uploads the dir
+#     as a per-shard build artifact (drained later by the desktop drainer). Also the
+#     fallback when a Blob PUT fails, so screenshots are never dropped.
+#  3. neither → POST bytes to the API (uploads to Drive inline; legacy slow path).
+# All of this stays OFF the scrape hot path relative to Drive: Drive upload happens
+# in the drainer, never on the runner.
 _SHOT_DIR = os.environ.get("PHASE2_SHOT_DIR") or None
 _SHOT_MANIFEST_LOCK = threading.Lock()
 
 
 def _sink_shots(state, run_id, pid, attempts, shots):
-    """Persist a place's screenshots — to the artifact dir if PHASE2_SHOT_DIR is set,
-    else upload via the API `state`. Best-effort; callers wrap in try/except."""
+    """Persist a place's screenshots — Blob staging, artifact dir, or the API,
+    in that order (see module comment). Best-effort; callers wrap in try/except."""
     if not shots:
         return
+    from cloud import blob_shots
+    if blob_shots.blob_sas_url():
+        failed = {}
+        for kind, src in shots.items():
+            try:
+                blob_shots.put_shot(run_id, pid, kind, attempts, src)
+            except Exception:
+                logger.warning("phase2.shot_blob_put_failed run_id=%s pid=%s kind=%s",
+                               run_id, pid, kind, exc_info=True)
+                failed[kind] = src
+        if not failed:
+            return
+        shots = failed  # fall through: stage the failures via dir/API instead
     if _SHOT_DIR:
         Path(_SHOT_DIR).mkdir(parents=True, exist_ok=True)
         manifest = Path(_SHOT_DIR) / "manifest.jsonl"
@@ -54,6 +71,41 @@ def _sink_shots(state, run_id, pid, attempts, shots):
                                         "file": fname}) + "\n")
     else:
         state.upload_screenshots(run_id, pid, attempts, shots)
+
+
+def _sink_photos(run_id, pid, image_urls):
+    """Mirror place photos (CDN URLs) into Blob under <run_id>/<pid>/. Best-effort:
+    never fails the scrape; no artifact fallback (the CDN URLs stay in the metadata,
+    so photos can be backfilled later by re-fetching them)."""
+    from cloud import blob_shots
+    if not blob_shots.photos_enabled():
+        return
+    try:
+        blob_shots.upload_place_photos(run_id, pid, image_urls)
+    except Exception:
+        logger.warning("phase2.photo_sink_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
+
+
+def _horeca_one(session, run_id, pid, row):
+    """HoReCa capture (PHASE2_HORECA=1): menu/photo dates + imagery on the still-open
+    panel. Result is embedded into `row` (rides the data JSON into place_data — no
+    API change); menu cards are mirrored to Blob. Best-effort: never fails the place."""
+    if not hasattr(session, "horeca_capture"):
+        return
+    try:
+        hc = session.horeca_capture(pid)
+        if not hc:
+            return
+        row["horeca"] = hc
+        from cloud import blob_shots
+        if blob_shots.photos_enabled() and hc.get("menu_photos"):
+            try:
+                blob_shots.upload_menu_photos(run_id, pid, hc["menu_photos"])
+            except Exception:
+                logger.warning("phase2.menu_sink_failed run_id=%s pid=%s",
+                               run_id, pid, exc_info=True)
+    except Exception:
+        logger.warning("phase2.horeca_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
 
 
 def _resolve_concurrency(concurrency) -> int:
@@ -139,9 +191,11 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
                     row = session.scrape(pid)
                     if not row or (row.get("name") or "") in ("", "FAILED"):
                         raise RuntimeError("blank-after-warmup / no data")
+                    _horeca_one(session, run_id, pid, row)   # before serializing
                     urls = _split_image_urls(row.get("image_urls"))
                     pend_done.append({"place_id": pid, "attempts": attempts,
                                       "data": json.dumps(row, default=str), "image_urls": urls})
+                    _sink_photos(run_id, pid, urls)
                     # Page screenshots ride a separate multipart endpoint (bytes -> API ->
                     # Drive), guarded by the same lease attempts. Best-effort: a failed
                     # upload must never fail the scrape or block the metadata submit.
@@ -185,9 +239,11 @@ def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state):
         row = session.scrape(pid)
         if not row or (row.get("name") or "") in ("", "FAILED"):
             raise RuntimeError("blank-after-warmup / no data")
+        _horeca_one(session, run_id, pid, row)   # before serializing
         urls = _split_image_urls(row.get("image_urls"))
         done = {"place_id": pid, "attempts": attempts,
                 "data": json.dumps(row, default=str), "image_urls": urls}
+        _sink_photos(run_id, pid, urls)
         if capture_shots:
             try:
                 shots = (session.screenshot_paths(pid)
