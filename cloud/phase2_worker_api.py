@@ -108,6 +108,20 @@ def _horeca_one(session, run_id, pid, row):
         logger.warning("phase2.horeca_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
 
 
+def _lease_with_retry(state, run_id, shard, batch, attempts: int = 5):
+    """Claim a batch, retrying on empty results. Empty lease ≠ empty queue:
+    with concurrent claimers (multiple API replicas / fleets) the READPAST
+    claim can skip locked rows and return nothing while thousands remain
+    queued. Backs off 15/30/45/60s (+shard jitter) before concluding dry."""
+    for i in range(attempts):
+        leased = state.claim_place_ids(run_id, str(shard), int(batch))
+        if leased:
+            return leased
+        if i + 1 < attempts:
+            time.sleep(min(60.0, 15.0 * (i + 1)) + (hash(str(shard)) % 7))
+    return []
+
+
 def _resolve_concurrency(concurrency) -> int:
     """Resolve K from the arg or PHASE2_CONCURRENCY (default 1), clamped to [1, 5]."""
     if concurrency is None:
@@ -181,7 +195,7 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
                 break
             if max_places is not None and (result.done + result.failed + len(pend_done) + len(pend_failed)) >= max_places:
                 break
-            leased = state.claim_place_ids(run_id, str(shard), int(batch))
+            leased = _lease_with_retry(state, run_id, shard, batch)
             if not leased:
                 break
             for rec in leased:
@@ -375,7 +389,7 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
                     last_flush = time.monotonic()
                 time.sleep(0.2)
                 continue
-            leased = state.claim_place_ids(run_id, str(shard), int(batch))
+            leased = _lease_with_retry(state, run_id, shard, batch)
             if not leased:
                 break
             for rec in leased:
