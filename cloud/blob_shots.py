@@ -91,8 +91,15 @@ def photo_name(run_id: str, place_id: str, seq: int, ext: str) -> str:
 
 
 def _put_blob(name: str, body: bytes, content_type: str, meta: dict,
-              sas_url: str | None = None, session=None) -> None:
-    """PUT one blob (BlockBlob). Raises on final failure."""
+              sas_url: str | None = None, session=None,
+              skip_existing: bool = False) -> bool:
+    """PUT one blob (BlockBlob). Raises on final failure.
+
+    `skip_existing` sends `If-None-Match: *`: Azure refuses with 409 (BlobAlreadyExists) when a blob
+    of that name already exists, and that is returned as False (nothing
+    written). Makes photo mirroring idempotent across re-runs — the SAS is cw
+    only, so a HEAD exists-check is not possible; the CDN download still
+    happens, only the upload/overwrite is saved. Returns True when written."""
     sas_url = sas_url or blob_sas_url()
     if not sas_url:
         raise RuntimeError("PHASE2_SHOT_BLOB_SAS not set")
@@ -108,13 +115,17 @@ def _put_blob(name: str, body: bytes, content_type: str, meta: dict,
     # Metadata names must be simple identifiers; values ASCII.
     for k, v in meta.items():
         headers[f"x-ms-meta-{k}"] = str(v)
+    if skip_existing:
+        headers["If-None-Match"] = "*"
     http = session or requests
     last_exc: Exception | None = None
     for attempt in range(_PUT_ATTEMPTS):
         try:
             resp = http.put(url, data=body, headers=headers, timeout=_PUT_TIMEOUT_S)
             if resp.status_code == 201:
-                return
+                return True
+            if skip_existing and resp.status_code in (409, 412):
+                return False                      # BlobAlreadyExists: idempotent skip
             # 403 = SAS expired/wrong perms: retrying won't help.
             if resp.status_code == 403:
                 raise RuntimeError(f"blob PUT forbidden (SAS expired or missing cw perms): {resp.status_code}")
@@ -163,7 +174,7 @@ def upload_menu_photos(run_id: str, place_id: str, menu_photos,
                       "image/jpeg",
                       {"runid": run_id, "placeid": place_id, "kind": "menu",
                        "seq": seq, "caption": date.encode("ascii", "ignore").decode()},
-                      sas_url=sas_url, session=session)
+                      sas_url=sas_url, session=session, skip_existing=True)
             return True
         except Exception:
             logger.debug("menu_upload_failed pid=%s seq=%d", place_id, seq, exc_info=True)
@@ -209,7 +220,7 @@ def upload_place_photos(run_id: str, place_id: str, image_urls,
             _put_blob(photo_name(run_id, place_id, seq, ext), r.content,
                       ctype if ctype in _EXT_BY_CTYPE else "image/jpeg",
                       {"runid": run_id, "placeid": place_id, "kind": "photo", "seq": seq},
-                      sas_url=sas_url, session=session)
+                      sas_url=sas_url, session=session, skip_existing=True)
             return True
         except Exception:
             logger.debug("photo_upload_failed pid=%s seq=%d", place_id, seq, exc_info=True)
