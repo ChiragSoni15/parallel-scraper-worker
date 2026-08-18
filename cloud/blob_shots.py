@@ -187,7 +187,10 @@ def upload_place_photos(run_id: str, place_id: str, image_urls,
         max_photos = photos_max()
     urls = [u for u in (image_urls or []) if u]
     try:
-        urls = [_upscale_url(u) for u in _dedupe_urls(urls)]
+        # _dedupe_urls parses the engine's ';'-joined URL *string*; handing it the
+        # list stringified the whole list into one junk URL and silently mirrored
+        # zero photos (no exception, so the guard below never caught it).
+        urls = [_upscale_url(u) for u in _dedupe_urls(";".join(urls))]
     except Exception:
         pass
     urls = urls[:max_photos]

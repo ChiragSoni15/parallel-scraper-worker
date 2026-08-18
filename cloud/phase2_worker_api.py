@@ -108,17 +108,69 @@ def _horeca_one(session, run_id, pid, row):
         logger.warning("phase2.horeca_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
 
 
-def _lease_with_retry(state, run_id, shard, batch, attempts: int = 5):
-    """Claim a batch, retrying on empty results. Empty lease ≠ empty queue:
+def _panel_extras_one(session, run_id, pid):
+    """Overview-pane capture (PHASE2_PANEL_EXTRAS=1). Returns a row for
+    /phase2/attributes, or None when the toggle is off or nothing usable came
+    back. Runs AFTER _horeca_one: it re-navigates to the place URL, and the
+    gallery walk cannot survive that. Best-effort — these are additive fields and
+    must never fail a place that already scraped fine."""
+    if not hasattr(session, "panel_extras"):
+        return None
+    try:
+        ex = session.panel_extras(pid)
+    except Exception:
+        logger.warning("phase2.panel_extras_failed run_id=%s pid=%s", run_id, pid,
+                       exc_info=True)
+        return None
+    if not ex:
+        return None
+    row = {k: ex.get(k) for k in
+           ("share_link", "price_range_text", "price_min", "price_max",
+            "price_currency", "price_reported_by", "has_menu_tab",
+            "popular_times", "hours", "links", "menu_items")}
+    row["place_id"] = pid
+    row["menu_item_count"] = len(ex.get("menu_items") or [])
+    row["has_popular_times"] = bool(ex.get("popular_times"))
+    row["has_web_results"] = bool(ex.get("links"))
+    row["hours_captured"] = bool(ex.get("hours"))
+    return row
+
+
+def _flush_attrs(state, run_id, pend_attrs):
+    """Submit buffered Overview rows. Never raises: losing additive fields must
+    not lose the metadata flush that rides beside it."""
+    if not pend_attrs:
+        return
+    try:
+        out = state.submit_attributes(run_id, list(pend_attrs))
+        logger.info("phase2.attrs_flush rows=%d %s", len(pend_attrs), out)
+    except Exception:
+        logger.warning("phase2.attrs_flush_failed run_id=%s rows=%d", run_id,
+                       len(pend_attrs), exc_info=True)
+    pend_attrs.clear()
+
+
+def _lease_with_retry(state, run_id, shard, batch, attempts: int = 5,
+                      deadline: float | None = None):
+    """Claim a batch, retrying on empty results. Empty lease != empty queue:
     with concurrent claimers (multiple API replicas / fleets) the READPAST
     claim can skip locked rows and return nothing while thousands remain
-    queued. Backs off 15/30/45/60s (+shard jitter) before concluding dry."""
+    queued. Backs off 15/30/45/60s (+shard jitter) before concluding dry.
+
+    `deadline` is a time.monotonic() stamp past which backing off is pointless —
+    the shard is out of budget and will exit on the next loop anyway. Without it
+    a drained shard blocks ~150s at the end of every run, and any caller with no
+    time left (max_minutes=0) waits out the full ladder before returning.
+    """
     for i in range(attempts):
         leased = state.claim_place_ids(run_id, str(shard), int(batch))
         if leased:
             return leased
-        if i + 1 < attempts:
-            time.sleep(min(60.0, 15.0 * (i + 1)) + (hash(str(shard)) % 7))
+        if i + 1 >= attempts:
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        time.sleep(min(60.0, 15.0 * (i + 1)) + (hash(str(shard)) % 7))
     return []
 
 
@@ -170,6 +222,7 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
     capture_shots = os.environ.get("PHASE2_CAPTURE_SCREENSHOTS", "1") != "0"
     pend_done: list[dict] = []
     pend_failed: list[dict] = []
+    pend_attrs: list[dict] = []
 
     def flush():
         nonlocal last_flush
@@ -185,6 +238,7 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
                         (result.done + result.failed) / max(0.001, time.monotonic() - started))
         pend_done.clear()
         pend_failed.clear()
+        _flush_attrs(state, run_id, pend_attrs)
         last_flush = time.monotonic()
 
     n_since_recycle = 0
@@ -195,7 +249,8 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
                 break
             if max_places is not None and (result.done + result.failed + len(pend_done) + len(pend_failed)) >= max_places:
                 break
-            leased = _lease_with_retry(state, run_id, shard, batch)
+            leased = _lease_with_retry(state, run_id, shard, batch,
+                                       deadline=started + stop_after)
             if not leased:
                 break
             for rec in leased:
@@ -209,6 +264,9 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
                     urls = _split_image_urls(row.get("image_urls"))
                     pend_done.append({"place_id": pid, "attempts": attempts,
                                       "data": json.dumps(row, default=str), "image_urls": urls})
+                    _ex = _panel_extras_one(session, run_id, pid)   # last: it re-navigates
+                    if _ex:
+                        pend_attrs.append(_ex)
                     _sink_photos(run_id, pid, urls)
                     # Page screenshots ride a separate multipart endpoint (bytes -> API ->
                     # Drive), guarded by the same lease attempts. Best-effort: a failed
@@ -244,7 +302,8 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
 
 
 def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state):
-    """Scrape a single pid on `session`. Return (done_dict_or_None, failed_dict_or_None).
+    """Scrape a single pid on `session`.
+    Return (done_dict_or_None, failed_dict_or_None, extras_row_or_None).
 
     Screenshot upload uses `shot_state` (this thread's own HttpState) and is
     best-effort: a failed upload must never fail the scrape or block the submit.
@@ -266,10 +325,11 @@ def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state):
             except Exception:
                 logger.warning("phase2.shot_sink_failed run_id=%s pid=%s",
                                run_id, pid, exc_info=True)
-        return done, None
+        # Last, because it re-navigates the page away from the scraped panel.
+        return done, None, _panel_extras_one(session, run_id, pid)
     except Exception as exc:
         logger.warning("phase2.place_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
-        return None, {"place_id": pid, "attempts": attempts, "error": str(exc)}
+        return None, {"place_id": pid, "attempts": attempts, "error": str(exc)}, None
 
 
 def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
@@ -295,6 +355,7 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
 
     pend_done: list[dict] = []
     pend_failed: list[dict] = []
+    pend_attrs: list[dict] = []
     lock = threading.Lock()
     work_q: "queue.Queue" = queue.Queue()  # unbounded: items are tiny tuples
     _SENTINEL = object()
@@ -330,13 +391,15 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
             if item is _SENTINEL:
                 return
             pid, attempts = item
-            done, failed = _scrape_one(session, run_id, pid, attempts,
-                                       capture_shots, shot_state)
+            done, failed, extras = _scrape_one(session, run_id, pid, attempts,
+                                               capture_shots, shot_state)
             with lock:
                 if done is not None:
                     pend_done.append(done)
                 else:
                     pend_failed.append(failed)
+                if extras:
+                    pend_attrs.append(extras)
             n_since_recycle += 1
             if n_since_recycle >= recycle_every:
                 try:
@@ -349,8 +412,11 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
         with lock:
             done = pend_done[:]
             failed = pend_failed[:]
+            attrs = pend_attrs[:]
             pend_done.clear()
             pend_failed.clear()
+            pend_attrs.clear()
+        _flush_attrs(state, run_id, attrs)
         if done or failed:
             out = state.submit(run_id, done, failed)
             acc = int(out.get("accepted", 0))
@@ -389,7 +455,8 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
                     last_flush = time.monotonic()
                 time.sleep(0.2)
                 continue
-            leased = _lease_with_retry(state, run_id, shard, batch)
+            leased = _lease_with_retry(state, run_id, shard, batch,
+                                       deadline=started + stop_after)
             if not leased:
                 break
             for rec in leased:

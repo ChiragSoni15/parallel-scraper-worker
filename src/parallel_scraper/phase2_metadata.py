@@ -503,6 +503,36 @@ class PlaywrightSession:
         self.places_scraped += 1
         return captured[0] if captured else None
 
+    def panel_extras(self, place_id: str) -> Optional[dict]:
+        """Overview-pane capture (price band, hours, popular times, links, share
+        link, structured menu). Gated by env PHASE2_PANEL_EXTRAS=1.
+
+        Navigates BACK to the place URL first: scrape() leaves the page on the
+        reviews pane, which replaces Overview, and every module below lives on
+        Overview. Run this AFTER horeca_capture — the gallery walk needs the
+        post-scrape panel state and a re-goto does not reproduce it.
+        Never raises; returns None when off or the page is dead.
+        """
+        import os as _os
+        if _os.environ.get("PHASE2_PANEL_EXTRAS", "0") != "1":
+            return None
+        if not self._page_alive():
+            return None
+        from parallel_scraper.panel_extras import capture_panel_extras
+        want_menu = _os.environ.get("PHASE2_MENU_TAB", "1") != "0"
+
+        async def _do() -> dict:
+            await self._page.goto(build_place_url(place_id),
+                                  wait_until="domcontentloaded", timeout=60_000)
+            return await capture_panel_extras(self._page, want_menu=want_menu)
+
+        try:
+            return self._loop.run_until_complete(_do())
+        except Exception:
+            logger.warning("phase2_session.panel_extras_failed place_id=%s",
+                           place_id, exc_info=True)
+            return None
+
     def horeca_capture(self, place_id: str, photo_cap: int | None = None) -> Optional[dict]:
         """HoReCa menu/photo/date/imagery capture on the CURRENT page — call
         right after scrape(place_id) while the panel is still open. Gated by

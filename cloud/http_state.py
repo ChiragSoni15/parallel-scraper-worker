@@ -75,6 +75,12 @@ class HttpState:
         return self._request("POST", "/phase2/results",
                             json={"run_id": run_id, "done": done, "failed": failed})
 
+    def submit_attributes(self, run_id: str, rows: list[dict]) -> dict:
+        """POST Overview-pass scalars. Best-effort at the call site: these are
+        additive fields, never a reason to fail a scrape."""
+        return self._request("POST", "/phase2/attributes",
+                             json={"run_id": run_id, "rows": rows})
+
     def reclaim_place_ids(self, run_id: str, older_than_minutes: int = 30) -> int:
         out = self._request("POST", "/phase2/reclaim",
                             json={"run_id": run_id, "older_than_minutes": int(older_than_minutes)})
