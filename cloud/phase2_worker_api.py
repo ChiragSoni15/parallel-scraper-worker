@@ -127,7 +127,7 @@ def _panel_extras_one(session, run_id, pid):
     row = {k: ex.get(k) for k in
            ("share_link", "price_range_text", "price_min", "price_max",
             "price_currency", "price_reported_by", "has_menu_tab",
-            "popular_times", "hours", "links", "menu_items")}
+            "popular_times", "hours", "links", "menu_items", "amenities")}
     row["place_id"] = pid
     row["menu_item_count"] = len(ex.get("menu_items") or [])
     row["has_popular_times"] = bool(ex.get("popular_times"))

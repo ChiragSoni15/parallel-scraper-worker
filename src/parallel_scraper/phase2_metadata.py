@@ -520,11 +520,13 @@ class PlaywrightSession:
             return None
         from parallel_scraper.panel_extras import capture_panel_extras
         want_menu = _os.environ.get("PHASE2_MENU_TAB", "1") != "0"
+        want_about = _os.environ.get("PHASE2_ABOUT_TAB", "1") != "0"
 
         async def _do() -> dict:
             await self._page.goto(build_place_url(place_id),
                                   wait_until="domcontentloaded", timeout=60_000)
-            return await capture_panel_extras(self._page, want_menu=want_menu)
+            return await capture_panel_extras(self._page, want_menu=want_menu,
+                                              want_about=want_about)
 
         try:
             ex = self._loop.run_until_complete(_do())

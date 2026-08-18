@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 SETTLE_MS_DEFAULT = 5_000        # 2s proved flaky right after a gallery walk
 MENU_SETTLE_MS = 3_500
 CHIP_SETTLE_MS = 3_000
+ABOUT_SETTLE_MS = 2_500
 MAX_CHIP_TRIES = 3        # photo-only Menu tabs yield nothing; cap the hunt
 SHARE_CLICK_MS = 15_000   # 6s lost 12% of links under fleet contention
 SHARE_POLL_TRIES = 100    # x100ms = 10s for the dialog to render
@@ -97,6 +98,22 @@ _JS_CHIPS = """() => {
   const ov = all.find(b => b.getAttribute('role') !== 'tab' && (b.innerText || '').trim() === 'Overview');
   const row = ov ? [...ov.parentElement.querySelectorAll('button')] : all;
   return row.map(b => (b.innerText || '').trim());
+}"""
+
+# About tab: h2 = section ('Accessibility', 'Service options', 'Payments', ...),
+# li[aria-label] = item ('Has wheelchair-accessible entrance', 'Does not have ...').
+_JS_ABOUT = """() => {
+  const root = document.querySelector('div[role="main"]') || document.body;
+  const out = [];
+  root.querySelectorAll('h2').forEach(h => {
+    const section = (h.innerText || '').trim();
+    if (!section) return;
+    h.parentElement.querySelectorAll('li').forEach(li => {
+      const label = li.getAttribute('aria-label') || (li.innerText || '').trim();
+      if (label) out.push({section, label: label.replace(/\s+/g, ' ').trim()});
+    });
+  });
+  return out;
 }"""
 
 # Menu items are read from the DOM, not from flattened panel text: innerText loses
@@ -311,7 +328,8 @@ def _clean_hours_text(a: str) -> str:
 
 
 async def capture_panel_extras(page, want_menu: bool = True,
-                               settle_ms: int = SETTLE_MS_DEFAULT) -> dict:
+                               settle_ms: int = SETTLE_MS_DEFAULT,
+                               want_about: bool = True) -> dict:
     """Capture the Overview modules from the panel currently on `page`.
 
     `page` must already be on a fresh place URL. Never raises — each section
@@ -321,7 +339,7 @@ async def capture_panel_extras(page, want_menu: bool = True,
         "share_link": None, "price_range_text": None, "price_min": None,
         "price_max": None, "price_currency": None, "price_reported_by": None,
         "popular_times": [], "popular_times_day": None, "hours": [], "links": [],
-        "has_menu_tab": False, "menu_items": [], "errors": [],
+        "has_menu_tab": False, "menu_items": [], "amenities": [], "errors": [],
     }
     try:
         await page.wait_for_timeout(settle_ms)
@@ -377,6 +395,41 @@ async def capture_panel_extras(page, want_menu: bool = True,
             out["menu_items"] = await _capture_menu(page)
         except Exception as exc:
             out["errors"].append(f"menu: {exc}")
+    if want_about and any("about" in t.lower() for t in tabs):
+        try:
+            out["amenities"] = await _capture_about(page)
+        except Exception as exc:
+            out["errors"].append(f"about: {exc}")
+    return out
+
+
+async def _capture_about(page) -> list[dict]:
+    """Open the About tab and read every section/item. ~2.6s. Replaces the
+    engine's `amenities` (0% captured) and `about` (3.9%, wrong element)."""
+    await page.locator('button[role="tab"]').filter(has_text="About").first.click(timeout=6_000)
+    await page.wait_for_timeout(ABOUT_SETTLE_MS)
+    return normalize_amenities(await page.evaluate(_JS_ABOUT))
+
+
+_NEGATIVE = re.compile(r"^(Does not|Doesn't|No |Not |Isn't|Is not)", re.I)
+
+
+def normalize_amenities(rows) -> list[dict]:
+    """[{section, label}] -> [{section, item, present}], deduped.
+
+    Google phrases absence in the label itself ('Does not have wheelchair-
+    accessible car park', 'No delivery'); the item text is kept verbatim so
+    nothing is lost, `present` is the parsed polarity.
+    """
+    out, seen = [], set()
+    for r in rows or []:
+        section = (r.get("section") or "").strip()[:60]
+        item = (r.get("label") or "").strip()[:120]
+        if not section or not item or (section, item) in seen:
+            continue
+        seen.add((section, item))
+        out.append({"section": section, "item": item,
+                    "present": not bool(_NEGATIVE.match(item))})
     return out
 
 
