@@ -29,6 +29,9 @@ SETTLE_MS_DEFAULT = 5_000        # 2s proved flaky right after a gallery walk
 MENU_SETTLE_MS = 3_500
 CHIP_SETTLE_MS = 3_000
 MAX_CHIP_TRIES = 3        # photo-only Menu tabs yield nothing; cap the hunt
+SHARE_CLICK_MS = 15_000   # 6s lost 12% of links under fleet contention
+SHARE_POLL_TRIES = 100    # x100ms = 10s for the dialog to render
+SHARE_ATTEMPTS = 2
 
 _DOWS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 _TRACKING = {"fbclid", "opi", "sa", "ved", "usg", "gclid", "_aem",
@@ -257,17 +260,7 @@ async def capture_panel_extras(page, want_menu: bool = True,
         out["errors"].append(f"links: {exc}")
 
     # Share BEFORE any tab switch — the button is not on the Menu pane.
-    try:
-        await page.locator('button[aria-label^="Share"], button:has-text("Share")'
-                           ).first.click(timeout=6_000)
-        for _ in range(40):                      # poll ~4s rather than sleep blind
-            out["share_link"] = await page.evaluate(_JS_SHARE)
-            if out["share_link"]:
-                break
-            await page.wait_for_timeout(100)
-        await page.keyboard.press("Escape")
-    except Exception as exc:
-        out["errors"].append(f"share: {exc}")
+    out["share_link"] = await _capture_share(page, out)
 
     tabs = panel.get("tabs") or []
     out["has_menu_tab"] = any("menu" in t.lower() for t in tabs)
@@ -277,6 +270,37 @@ async def capture_panel_extras(page, want_menu: bool = True,
         except Exception as exc:
             out["errors"].append(f"menu: {exc}")
     return out
+
+
+async def _capture_share(page, out: dict) -> str | None:
+    """Click Share and read the maps.app.goo.gl link.
+
+    Every listing has a Share button — a miss is always contention, never the
+    listing. A 1,000-place fleet run lost 12% of share links at 60 concurrent
+    workers, yet every sampled failure captured the link first try in 0.5-0.8s
+    when re-run alone. Three browsers per runner share one CPU, so the click and
+    the dialog render both stretch. Hence generous timeouts and one retry: the
+    happy path still costs ~0.6s.
+    """
+    for attempt in range(SHARE_ATTEMPTS):
+        try:
+            await page.locator('button[aria-label^="Share"], button:has-text("Share")'
+                               ).first.click(timeout=SHARE_CLICK_MS)
+            for _ in range(SHARE_POLL_TRIES):
+                link = await page.evaluate(_JS_SHARE)
+                if link:
+                    await page.keyboard.press("Escape")
+                    return link
+                await page.wait_for_timeout(100)
+            await page.keyboard.press("Escape")   # dialog open but no link yet
+        except Exception as exc:
+            if attempt + 1 >= SHARE_ATTEMPTS:
+                out["errors"].append(f"share: {exc}")
+                return None
+        if attempt + 1 < SHARE_ATTEMPTS:
+            await page.wait_for_timeout(500)
+    out["errors"].append("share: no link after retries")
+    return None
 
 
 async def _capture_menu(page) -> list[dict]:
