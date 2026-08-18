@@ -35,7 +35,7 @@ SHARE_POLL_TRIES = 100    # x100ms = 10s for the dialog to render
 SHARE_ATTEMPTS = 2
 
 _DOWS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
-_TRACKING = {"fbclid", "opi", "sa", "ved", "usg", "gclid", "_aem",
+_TRACKING = {"fbclid", "opi", "sa", "ved", "usg", "gclid", "_aem", "ltsid", "igsh", "igshid",
              "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"}
 _LINK_KINDS = (
     ("instagram.com", "instagram"), ("facebook.com", "facebook"),
@@ -168,7 +168,7 @@ def unwrap_url(raw: str | None) -> str | None:
 def classify_link(url: str) -> str:
     host = (urllib.parse.urlsplit(url).netloc or "").lower()
     for needle, kind in _LINK_KINDS:
-        if needle in host:
+        if host == needle or host.endswith("." + needle):   # not substring: 't.me' in 'meta.com'
             return kind
     return "website"
 
