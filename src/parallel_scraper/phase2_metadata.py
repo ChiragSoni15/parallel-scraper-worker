@@ -527,7 +527,15 @@ class PlaywrightSession:
             return await capture_panel_extras(self._page, want_menu=want_menu)
 
         try:
-            return self._loop.run_until_complete(_do())
+            ex = self._loop.run_until_complete(_do())
+            if ex.get("degraded"):
+                # Session-scoped degraded panel (no tab strip): a fresh browser gets
+                # the full panel back at once. Relaunch (~2s) and retry once.
+                logger.info("phase2_session.panel_degraded place_id=%s — relaunching", place_id)
+                self._close_browser()
+                self._open_browser()
+                ex = self._loop.run_until_complete(_do())
+            return ex
         except Exception:
             logger.warning("phase2_session.panel_extras_failed place_id=%s",
                            place_id, exc_info=True)

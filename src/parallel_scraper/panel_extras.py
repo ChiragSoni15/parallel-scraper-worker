@@ -59,8 +59,28 @@ _JS_PANEL = """() => {
     .map(e => e.getAttribute('aria-label') || '').filter(a => a && a.length < 160);
   const links = [...document.querySelectorAll('a[href]')]
     .map(a => a.href).filter(h => /^https?:/.test(h));
+  // Popular times: ALL 7 days are in the DOM, one container per day (Sunday
+  // first), only the selected day visible. Bar labels ('37% busy at 4 am.')
+  // carry no day name, so the day is positional: read bars per container.
+  let popular = null;
+  const region = document.querySelector('div[role="region"][aria-label^="Popular times"]');
+  if (region) {
+    const bar0 = region.querySelector('[aria-label*="busy"]');
+    let car = bar0;
+    while (car && car !== region && car.children.length !== 7) car = car.parentElement;
+    if (car && car !== region) {
+      const kids = [...car.children];
+      const days = kids.map(k => [...k.querySelectorAll('[aria-label*="busy"]')]
+                                   .map(b => b.getAttribute('aria-label')));
+      const visible = kids.findIndex(k => [...k.querySelectorAll('[aria-label*="busy"]')]
+                                           .some(b => b.offsetWidth || b.offsetHeight));
+      const sel = [...region.querySelectorAll('*')].map(e => (e.childElementCount ? '' : (e.innerText || '')).trim())
+                    .find(t => /^(Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)days?$/i.test(t)) || null;
+      popular = {days, visible, selected: sel};
+    }
+  }
   return {
-    lines, aria, links,
+    lines, aria, links, popular,
     tabs: [...document.querySelectorAll('button[role="tab"]')].map(b => b.innerText.trim()),
   };
 }"""
@@ -183,17 +203,61 @@ def parse_popular_times(aria: list[str], selected_day: str | None = None) -> lis
     """
     out: list[dict] = []
     for a in aria:
-        b = _BUSY_RE.search(a)
-        if not b:
+        p = _parse_bar(a)
+        if not p:
             continue                      # not a bar: a dropdown option or other control
         d = _DOW_RE.search(a)             # day must come from THIS bar's label
         dow = d.group(0).capitalize() if d else (selected_day or None)
-        h = _HOUR_RE.search(a)
-        hour = None
-        if h:
-            hour = int(h.group(1)) % 12 + (12 if h.group(2).upper() == "PM" else 0)
-        out.append({"dow": dow, "hour_24": hour, "busy_pct": int(b.group(1))})
+        out.append({"dow": dow, "hour_24": p[0], "busy_pct": p[1]})
     return out
+
+
+def _parse_bar(a: str) -> tuple[int | None, int] | None:
+    """'37% busy at 4 am.' -> (4, 37); 'Currently 80% busy, usually 43% busy.' -> (h, 43).
+    None when the label is not a bar."""
+    m = re.search(r"usually\s+(\d{1,3})\s*%\s*busy", a, re.I) or _BUSY_RE.search(a)
+    if not m:
+        return None
+    h = _HOUR_RE.search(a)
+    hour = int(h.group(1)) % 12 + (12 if h.group(2).upper() == "PM" else 0) if h else None
+    return hour, int(m.group(1))
+
+
+def parse_popular_days(popular: dict | None) -> tuple[list[dict], str | None]:
+    """Structured popular-times block -> (bars for all 7 days, selected day).
+
+    `popular` = {days: [[bar labels] x7], visible: idx, selected: 'Tuesdays'} as
+    read by _JS_PANEL. Google renders the seven day-containers Sunday-first, but
+    rather than trust that, the day of the visible container is anchored to the
+    selector text and the rest are counted from it. Falls back to Sunday-first
+    when the selector is unreadable.
+    """
+    if not popular or not popular.get("days"):
+        return [], None
+    days = popular["days"]
+    order = ("Sunday",) + _DOWS[:-1]                       # Sunday-first
+    sel = None
+    m = _DOW_RE.search(popular.get("selected") or "")
+    if m:
+        sel = m.group(0).capitalize()
+    vis = popular.get("visible")
+    offset = 0
+    if sel and isinstance(vis, int) and vis >= 0:
+        offset = (order.index(sel) - vis) % 7
+    out: list[dict] = []
+    for i, labels in enumerate(days[:7]):
+        dow = order[(i + offset) % 7]
+        prev_hour = None
+        for a in labels or []:
+            p = _parse_bar(a or "")
+            if not p:
+                continue
+            hour = p[0]
+            if hour is None and prev_hour is not None:
+                hour = (prev_hour + 1) % 24       # live bar 'Currently 100% busy, usually 93% busy.'
+            prev_hour = hour                       # has no hour; bars are positional
+            out.append({"dow": dow, "hour_24": hour, "busy_pct": p[1]})
+    return out, sel
 
 
 def parse_selected_day(lines: list[str], aria: list[str]) -> str | None:
@@ -261,10 +325,21 @@ async def capture_panel_extras(page, want_menu: bool = True,
         return out
 
     lines, aria = panel.get("lines") or [], panel.get("aria") or []
+    if not panel.get("tabs"):
+        # Every real place panel has a tab strip (Overview/Reviews at least). Its
+        # absence is the DEGRADED panel Google serves intermittently per session
+        # (no popular times, no price, no Share) — a fresh browser gets the full
+        # panel straight back. Flag it so the caller can relaunch and retry.
+        out["errors"].append("panel: degraded (no tabs)")
+        out["degraded"] = True
+        return out
     try:
         out.update(parse_price(lines))
-        day = parse_selected_day(lines, aria)
-        out["popular_times"] = parse_popular_times(aria, selected_day=day)
+        bars, day = parse_popular_days(panel.get("popular"))
+        if not bars:                          # structure not found: old flat path
+            day = parse_selected_day(lines, aria)
+            bars = parse_popular_times(aria, selected_day=day)
+        out["popular_times"] = bars
         out["popular_times_day"] = day
         out["hours"] = parse_hours(aria)
     except Exception as exc:

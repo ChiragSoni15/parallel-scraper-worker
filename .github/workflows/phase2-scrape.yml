@@ -17,6 +17,8 @@ on:
       panel_extras: { required: false, type: string, default: "0" }  # 1 = Overview pass: price band, hours,
                                                                      #     popular times, links, share, menu tab
       menu_tab:    { required: false, type: string, default: "1" }   # 0 = skip the menu tab (the costliest part)
+      screenshots: { required: false, type: string, default: "1" }   # 0 = no panel screenshots (backfill passes)
+      photos:      { required: false, type: string, default: "1" }   # 0 = no CDN->blob photo mirroring
   # MANUAL DISPATCH ONLY. The 30-minute self-drain cron was removed: with 21
   # fleet repos it meant every one of them picked up a run within half an hour of
   # ACTIVE_RUN_ID being set, which is far more concurrency than the lease API can
@@ -114,7 +116,7 @@ jobs:
         env:
           WORKER_API_BASE: ${{ vars.WORKER_API_BASE }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
-          PHASE2_CAPTURE_SCREENSHOTS: "1"
+          PHASE2_CAPTURE_SCREENSHOTS: "${{ inputs.screenshots || '1' }}"
           # ASYNC screenshots, preferred path: PUT each PNG straight to an Azure Blob
           # staging container (write-only container SAS — no account key, no read/list).
           # The private drainer (cloud/drain_screenshots_blob.py) empties it to Drive
@@ -122,7 +124,7 @@ jobs:
           PHASE2_SHOT_BLOB_SAS: ${{ secrets.PHASE2_SHOT_BLOB_SAS }}
           # Mirror each place's photos (Google CDN -> Blob) under <run_id>/<place_id>/.
           # Best-effort; "0" disables. Cap keeps per-place time bounded.
-          PHASE2_PHOTOS_TO_BLOB: "1"
+          PHASE2_PHOTOS_TO_BLOB: "${{ inputs.photos || '1' }}"
           PHASE2_PHOTOS_MAX: "15"
           # Fallback staging (also catches individual failed blob PUTs): save PNGs + a
           # manifest to this dir; the step below uploads it as a build artifact, drained
