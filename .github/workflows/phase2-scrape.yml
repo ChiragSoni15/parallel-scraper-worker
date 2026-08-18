@@ -13,13 +13,15 @@ on:
       shards:      { required: false, type: string, default: "12" }
       max_minutes: { required: false, type: string, default: "300" }
       concurrency: { required: false, type: string, default: "3" }   # placeIds scraped at once PER shard (1-5)
-      horeca:      { required: false, type: string, default: "0" }   # 1 = menu/photo/date capture per place
-  # Self-drain: while repo var ACTIVE_RUN_ID is set, re-dispatch every 30 min.
-  # The plan job exits free when the queue is empty; the concurrency group
-  # below prevents overlap with a still-running dispatch. Clear ACTIVE_RUN_ID
-  # (or let the queue drain) to stop.
-  schedule:
-    - cron: "*/30 * * * *"
+      horeca:      { required: false, type: string, default: "0" }   # 1 = gallery walk: menu cards + photo dates
+      panel_extras: { required: false, type: string, default: "0" }  # 1 = Overview pass: price band, hours,
+                                                                     #     popular times, links, share, menu tab
+      menu_tab:    { required: false, type: string, default: "1" }   # 0 = skip the menu tab (the costliest part)
+  # MANUAL DISPATCH ONLY. The 30-minute self-drain cron was removed: with 21
+  # fleet repos it meant every one of them picked up a run within half an hour of
+  # ACTIVE_RUN_ID being set, which is far more concurrency than the lease API can
+  # take (502s appear past ~120 concurrent clients). Re-dispatch deliberately, or
+  # replace this with a scheduler that controls how many fleets join at once.
 
 # Scheduled runs have no inputs -> fall back to repo variables.
 concurrency:
@@ -133,6 +135,8 @@ jobs:
           # HoReCa capture: menu photos + posted dates + place-photo dates +
           # imagery class, embedded in the data JSON; menu cards -> Blob.
           PHASE2_HORECA: "${{ inputs.horeca || vars.ACTIVE_HORECA || '0' }}"
+          PHASE2_PANEL_EXTRAS: "${{ inputs.panel_extras || vars.ACTIVE_PANEL_EXTRAS || '0' }}"
+          PHASE2_MENU_TAB: "${{ inputs.menu_tab || vars.ACTIVE_MENU_TAB || '1' }}"
         run: >
           python -m cloud.phase2_worker_api
           --run-id "${{ inputs.run_id || vars.ACTIVE_RUN_ID }}"
