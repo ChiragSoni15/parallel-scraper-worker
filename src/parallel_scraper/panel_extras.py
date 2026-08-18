@@ -412,6 +412,7 @@ async def _capture_about(page) -> list[dict]:
 
 
 _NEGATIVE = re.compile(r"^(Does not|Doesn't|No |Not |Isn't|Is not)", re.I)
+_PUA_RE = re.compile(r"^[\ue000-\uf8ff\s]+")
 
 
 def normalize_amenities(rows) -> list[dict]:
@@ -424,12 +425,17 @@ def normalize_amenities(rows) -> list[dict]:
     out, seen = [], set()
     for r in rows or []:
         section = (r.get("section") or "").strip()[:60]
-        item = (r.get("label") or "").strip()[:120]
+        raw = (r.get("label") or "").strip()
+        # Without an aria-label the row text starts with Google's icon-font glyph
+        # (private-use codepoints): U+E5CA 'check' = present, U+E5CD 'close' = absent,
+        # others are item icons (U+E033 hearing loop). Strip them, keep the polarity.
+        glyph_absent = raw.startswith("\ue5cd")
+        item = _PUA_RE.sub("", raw).strip()[:120]
         if not section or not item or (section, item) in seen:
             continue
         seen.add((section, item))
         out.append({"section": section, "item": item,
-                    "present": not bool(_NEGATIVE.match(item))})
+                    "present": not (glyph_absent or bool(_NEGATIVE.match(item)))})
     return out
 
 
