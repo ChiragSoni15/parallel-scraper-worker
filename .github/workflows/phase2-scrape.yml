@@ -19,6 +19,8 @@ on:
       menu_tab:    { required: false, type: string, default: "1" }   # 0 = skip the menu tab (the costliest part)
       screenshots: { required: false, type: string, default: "1" }   # 0 = no panel screenshots (backfill passes)
       photos:      { required: false, type: string, default: "1" }   # 0 = no CDN->blob photo mirroring
+      batch:       { required: false, type: string, default: "20" }  # placeIds per lease call
+      flush_s:     { required: false, type: string, default: "20" }  # seconds between result/attribute POSTs
   # MANUAL DISPATCH ONLY. The 30-minute self-drain cron was removed: with 21
   # fleet repos it meant every one of them picked up a run within half an hour of
   # ACTIVE_RUN_ID being set, which is far more concurrency than the lease API can
@@ -139,12 +141,13 @@ jobs:
           PHASE2_HORECA: "${{ inputs.horeca || vars.ACTIVE_HORECA || '0' }}"
           PHASE2_PANEL_EXTRAS: "${{ inputs.panel_extras || vars.ACTIVE_PANEL_EXTRAS || '0' }}"
           PHASE2_MENU_TAB: "${{ inputs.menu_tab || vars.ACTIVE_MENU_TAB || '1' }}"
+          PHASE2_FLUSH_INTERVAL_S: "${{ inputs.flush_s || '20' }}"
         run: >
           python -m cloud.phase2_worker_api
           --run-id "${{ inputs.run_id || vars.ACTIVE_RUN_ID }}"
           --shard "${{ matrix.shard }}"
           --max-minutes "${{ inputs.max_minutes || '300' }}"
-          --concurrency "${{ inputs.concurrency || vars.ACTIVE_CONCURRENCY || '3' }}"
+          --concurrency "${{ inputs.concurrency || vars.ACTIVE_CONCURRENCY || '3' }}"           --batch "${{ inputs.batch || '20' }}"
 
       # The durable screenshot queue: each shard's captured PNGs + manifest.jsonl, uploaded
       # off the ephemeral runner. Drained to Drive later by cloud/drain_screenshots.py.
