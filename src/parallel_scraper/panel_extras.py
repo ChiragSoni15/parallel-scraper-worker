@@ -167,25 +167,50 @@ def parse_price(lines: list[str]) -> dict:
     return out
 
 
-def parse_popular_times(aria: list[str]) -> list[dict]:
-    """aria-labels -> [{dow, hour_24, busy_pct}]. Google emits one label per bar,
-    e.g. 'Tuesdays 6 AM 20% busy.'; day is sometimes only on the group heading, so
-    it is carried forward across bars."""
+def parse_popular_times(aria: list[str], selected_day: str | None = None) -> list[dict]:
+    """aria-labels -> [{dow, hour_24, busy_pct}].
+
+    A bar's label is 'Tuesdays 6 AM 20% busy.' — the day, when present, is IN the
+    bar's own label. The day-selector dropdown also contributes labels that are
+    bare day names ('Mondays'), and an earlier version carried the last day name
+    forward across bars: every bar in a 1,000-place run came back stamped
+    'Monday', including runs made on a Tuesday. So the day is only ever taken
+    from a label that is actually a bar (one carrying a busy value).
+
+    Google renders ONE day at a time (~24 bars), so `selected_day` — read from the
+    day selector — is the fallback when bar labels omit it. Unresolvable days are
+    left None for the caller to record honestly rather than guessed at.
+    """
     out: list[dict] = []
-    dow = None
     for a in aria:
-        d = _DOW_RE.search(a)
-        if d:
-            dow = d.group(0).capitalize()
         b = _BUSY_RE.search(a)
         if not b:
-            continue
+            continue                      # not a bar: a dropdown option or other control
+        d = _DOW_RE.search(a)             # day must come from THIS bar's label
+        dow = d.group(0).capitalize() if d else (selected_day or None)
         h = _HOUR_RE.search(a)
         hour = None
         if h:
             hour = int(h.group(1)) % 12 + (12 if h.group(2).upper() == "PM" else 0)
         out.append({"dow": dow, "hour_24": hour, "busy_pct": int(b.group(1))})
     return out
+
+
+def parse_selected_day(lines: list[str], aria: list[str]) -> str | None:
+    """The day the popular-times chart is currently showing.
+
+    The selector renders as a bare day name ('Tuesdays'), unlike a bar label which
+    always carries a busy value. Return the singular form.
+    """
+    for src in (aria, lines):
+        for t in src:
+            t = (t or "").strip()
+            if len(t) > 12 or _BUSY_RE.search(t):
+                continue
+            m = _DOW_RE.fullmatch(t.rstrip("s"))
+            if m:
+                return m.group(0).capitalize()
+    return None
 
 
 def parse_hours(aria: list[str]) -> list[dict]:
@@ -225,7 +250,7 @@ async def capture_panel_extras(page, want_menu: bool = True,
     out: dict = {
         "share_link": None, "price_range_text": None, "price_min": None,
         "price_max": None, "price_currency": None, "price_reported_by": None,
-        "popular_times": [], "hours": [], "links": [],
+        "popular_times": [], "popular_times_day": None, "hours": [], "links": [],
         "has_menu_tab": False, "menu_items": [], "errors": [],
     }
     try:
@@ -238,7 +263,9 @@ async def capture_panel_extras(page, want_menu: bool = True,
     lines, aria = panel.get("lines") or [], panel.get("aria") or []
     try:
         out.update(parse_price(lines))
-        out["popular_times"] = parse_popular_times(aria)
+        day = parse_selected_day(lines, aria)
+        out["popular_times"] = parse_popular_times(aria, selected_day=day)
+        out["popular_times_day"] = day
         out["hours"] = parse_hours(aria)
     except Exception as exc:
         out["errors"].append(f"parse: {exc}")
