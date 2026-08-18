@@ -110,7 +110,7 @@ _JS_ABOUT = """() => {
     if (!section) return;
     h.parentElement.querySelectorAll('li').forEach(li => {
       const label = li.getAttribute('aria-label') || (li.innerText || '').trim();
-      if (label) out.push({section, label: label.replace(/\s+/g, ' ').trim()});
+      if (label) out.push({section, label: label.replace(/\\s+/g, ' ').trim()});
     });
   });
   return out;
