@@ -471,8 +471,15 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
     finally:
         for _ in range(k):
             work_q.put(_SENTINEL)
-        for t in threads:
-            t.join()
+        # Keep flushing while the workers drain their buffer: a shard holds up to
+        # high_water + k results here (~28 at k=3), which took ~10 min to appear
+        # in /phase2/progress and would be lost to a runner kill.
+        while any(t.is_alive() for t in threads):
+            for t in threads:
+                t.join(timeout=1.0)
+            if flush_interval_s and (time.monotonic() - last_flush) >= flush_interval_s:
+                flush()
+                last_flush = time.monotonic()
         flush()  # final flush after every pid is accounted for
         with sessions_lock:
             for s in sessions:
