@@ -418,7 +418,19 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
             pend_attrs.clear()
         _flush_attrs(state, run_id, attrs)
         if done or failed:
-            out = state.submit(run_id, done, failed)
+            try:
+                out = state.submit(run_id, done, failed)
+            except Exception:
+                # A failed submit must not kill the feeder or drop the batch: put
+                # the rows back and try again next flush. (Before: the exception
+                # propagated, the feeder died into join(), and the batch — already
+                # popped from pend_* — was silently lost until reclaim.)
+                logger.warning("phase2.flush_failed rows=%d — requeued", len(done) + len(failed),
+                               exc_info=True)
+                with lock:
+                    pend_done[:0] = done
+                    pend_failed[:0] = failed
+                return
             acc = int(out.get("accepted", 0))
             stale = int(out.get("stale", 0))
             result.done += len(done)
