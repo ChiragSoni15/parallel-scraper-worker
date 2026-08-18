@@ -90,8 +90,14 @@ _JS_SHARE = """() => {
   return i ? i.value : null;
 }"""
 
-_JS_CHIPS = """() => [...document.querySelectorAll('div[role="main"] button')]
-    .map(b => (b.innerText || '').trim())"""
+# Category chips are the siblings of the non-tab 'Overview' chip. Fall back to
+# every panel button when that row is not found (MAX_CHIP_TRIES bounds the cost).
+_JS_CHIPS = """() => {
+  const all = [...document.querySelectorAll('div[role="main"] button')];
+  const ov = all.find(b => b.getAttribute('role') !== 'tab' && (b.innerText || '').trim() === 'Overview');
+  const row = ov ? [...ov.parentElement.querySelectorAll('button')] : all;
+  return row.map(b => (b.innerText || '').trim());
+}"""
 
 # Menu items are read from the DOM, not from flattened panel text: innerText loses
 # the name/description boundary (a short description is indistinguishable from a
@@ -406,7 +412,14 @@ async def _capture_share(page, out: dict) -> str | None:
 
 
 async def _capture_menu(page) -> list[dict]:
-    """Open the Menu tab and the first category chip, then read item rows.
+    """Open the Menu tab and walk EVERY category chip, reading item rows per chip.
+
+    The Menu tab lands on an 'Overview' chip (menu photos + highlights, no priced
+    rows); items sit behind the category chips that follow it — Juices, Burgers,
+    Pies And Pizza, ... Stopping at the first chip that yielded items stored 62 of
+    131 items (Juices only) on a sampled listing. Each chip costs ~2.5s; a chip
+    that yields nothing (photo-only) does not stop the walk, but MAX_CHIP_TRIES
+    consecutive empty chips do.
 
     Rows render as name / description / price stacked as separate lines, with the
     price line starting with the currency code.
@@ -414,25 +427,38 @@ async def _capture_menu(page) -> list[dict]:
     await page.locator('button[role="tab"]').filter(has_text="Menu").first.click(timeout=6_000)
     await page.wait_for_timeout(MENU_SETTLE_MS)
     items = normalize_menu_items(await page.evaluate(_JS_MENU_ITEMS))
-    if items:
-        return items
-    tried = 0
-    for chip in await page.evaluate(_JS_CHIPS):   # items hide behind a category
-        if not chip or len(chip) > 28 or chip in ("Overview", "Menu", "Reviews", "About"):
+    seen = {(i["name"], i["price_amount"]) for i in items}
+    empty_run = 0
+    for chip in await page.evaluate(_JS_CHIPS):
+        if not chip or len(chip) > 40 or chip in ("Overview", "Menu", "Reviews", "About"):
             continue
-        if tried >= MAX_CHIP_TRIES:
-            break                                  # photo-only menu: stop paying 3s a chip
-        tried += 1
+        if empty_run >= MAX_CHIP_TRIES:
+            break                                  # photo-only menu: stop paying per chip
         try:
             await page.locator('div[role="main"] button').filter(has_text=chip
                                                                  ).first.click(timeout=5_000)
-            await page.wait_for_timeout(CHIP_SETTLE_MS)
         except Exception:
+            empty_run += 1
             continue
-        items = normalize_menu_items(await page.evaluate(_JS_MENU_ITEMS))
-        if items:
-            return items
-    return []
+        fresh: list[dict] = []
+        for _ in range(CHIP_SETTLE_MS // 300):     # poll: most chips render in <1s
+            await page.wait_for_timeout(300)
+            got = normalize_menu_items(await page.evaluate(_JS_MENU_ITEMS))
+            fresh = [i for i in got if (i["name"], i["price_amount"]) not in seen]
+            if fresh:                              # one more read: catch late rows
+                await page.wait_for_timeout(400)
+                got = normalize_menu_items(await page.evaluate(_JS_MENU_ITEMS))
+                fresh = [i for i in got if (i["name"], i["price_amount"]) not in seen]
+                break
+        if not fresh:
+            empty_run += 1
+            continue
+        empty_run = 0
+        for i in fresh:
+            i["category"] = chip[:100]
+            seen.add((i["name"], i["price_amount"]))
+        items.extend(fresh)
+    return items
 
 
 def normalize_menu_items(rows) -> list[dict]:
