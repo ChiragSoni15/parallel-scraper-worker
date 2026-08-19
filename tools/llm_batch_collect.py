@@ -55,6 +55,15 @@ def main() -> None:
     client = genai.Client(api_key=key)
 
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # BatchJob does not expose its source file; the builder uploads it as "<client>_<dataset>_<shard>.jsonl",
+    # so map display_name -> file name once here.
+    files_by_display: dict[str, str] = {}
+    try:
+        for f in client.files.list():
+            if getattr(f, "display_name", None):
+                files_by_display[f.display_name] = f.name
+    except Exception as exc:  # noqa: BLE001
+        print(f"files.list failed: {str(exc)[:120]}")
     seen = collected = failed = 0
     for job in client.batches.list():
         dn = getattr(job, "display_name", "") or ""
@@ -73,7 +82,7 @@ def main() -> None:
         results_url = f"{base}/results/{shard}.jsonl"
         status_url = f"{base}/status/{shard}.json"
         state = getattr(job.state, "name", str(job.state))
-        src = getattr(getattr(job, "src", None), "file_name", None)
+        src = files_by_display.get(f"{cl}_{ds}_{shard}.jsonl")  # None once deleted (=> stub input_deleted stays True below)
         stats = getattr(job, "batch_stats", None)
         stub = {"client": cl, "dataset": ds, "shard": shard, "job": job.name, "display_name": dn, "state": state,
                 "model": getattr(job, "model", None), "src_file": src,
@@ -102,6 +111,8 @@ def main() -> None:
             err = getattr(job, "error", None)
             stub["error"] = str(err)[:500] if err else state
             failed += 1
+        if (state == "JOB_STATE_SUCCEEDED" or state in TERMINAL_BAD) and not src:
+            stub["input_deleted"] = True  # no file with that name left in the project
         if (state == "JOB_STATE_SUCCEEDED" or state in TERMINAL_BAD) and src and not a.keep_inputs:
             try:
                 client.files.delete(name=src)
