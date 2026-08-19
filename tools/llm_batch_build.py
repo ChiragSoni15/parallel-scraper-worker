@@ -60,9 +60,21 @@ def fetch_resized(url: str, dim: int) -> bytes:
     raise RuntimeError(f"fetch failed {url}: {last}")
 
 
+def _fetch_or_none(url: str, dim: int, optional: bool) -> bytes | None:
+    try:
+        return fetch_resized(url, dim)
+    except RuntimeError:
+        if optional:
+            print(f"  optional image missing, dropped: {url.rsplit('/', 1)[-1]}")
+            return None
+        raise
+
+
 def build_line(sk: dict, dim: int, pool: ThreadPoolExecutor) -> tuple[bytes, int]:
     parts = [{"text": sk["prompt"]}]
-    imgs = list(pool.map(lambda u: fetch_resized(u, dim), sk.get("images") or []))
+    urls = sk.get("images") or []
+    optional = set(sk.get("optional_images") or [])   # e.g. a listing screenshot: skip if gone, never fail the shard
+    imgs = [b for b in pool.map(lambda u: _fetch_or_none(u, dim, u in optional), urls) if b is not None]
     for b in imgs:
         parts.append({"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(b).decode("ascii")}})
     req = {"contents": [{"parts": parts}], "generationConfig": sk.get("generation_config") or {}}
