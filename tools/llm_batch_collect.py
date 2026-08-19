@@ -65,6 +65,10 @@ def main() -> None:
         if (a.client and cl != a.client) or (a.dataset and ds != a.dataset):
             continue
         seen += 1
+        try:  # list() omits src/dest/batch_stats; the full object has them
+            job = client.batches.get(name=job.name)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  batches.get({job.name}) failed: {str(exc)[:120]}")
         base = f"{CONTAINER}/llm-batch/{cl}/{ds}"
         results_url = f"{base}/results/{shard}.jsonl"
         status_url = f"{base}/status/{shard}.json"
