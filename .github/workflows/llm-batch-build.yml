@@ -1,0 +1,60 @@
+name: llm-batch-build
+
+# Generic: build Gemini Batch input chunks from client-written skeleton shards on blob,
+# upload to the Files API and create the batch jobs. Manual dispatch only.
+on:
+  workflow_dispatch:
+    inputs:
+      client:        { required: true,  type: string, description: "client id, e.g. flora" }
+      dataset:       { required: true,  type: string, description: "dataset id, e.g. riyadh" }
+      shards:        { required: true,  type: string, description: "comma-separated shard names, e.g. shard_001,shard_002" }
+      skeleton_base: { required: true,  type: string, description: "blob URL prefix holding <shard>.jsonl (no SAS)" }
+      model:         { required: true,  type: string, default: "gemini-3.7-flash" }
+      send_dim:      { required: false, type: string, default: "1536" }
+      max_parallel:  { required: false, type: string, default: "13" }
+
+concurrency:
+  group: llm-batch-${{ inputs.client }}-${{ inputs.dataset }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python3 -c 'import json,os; print("matrix=" + json.dumps([s.strip() for s in os.environ["SHARDS"].split(",") if s.strip()]))' >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel) }}
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet requests pillow google-genai
+      - name: Build + upload + create batch
+        env:
+          LLM_BATCH_GEMINI_KEY: ${{ secrets.LLM_BATCH_GEMINI_KEY }}
+          MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+        run: |
+          python tools/llm_batch_build.py \
+            --skeleton-url "${{ inputs.skeleton_base }}/${{ matrix.shard }}.jsonl" \
+            --client "${{ inputs.client }}" --dataset "${{ inputs.dataset }}" --shard "${{ matrix.shard }}" \
+            --model "${{ inputs.model }}" --send-dim "${{ inputs.send_dim }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: job-${{ inputs.client }}-${{ inputs.dataset }}-${{ matrix.shard }}
+          path: batch_out/*.job.json
+          retention-days: 7
