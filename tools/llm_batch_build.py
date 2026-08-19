@@ -111,6 +111,26 @@ def main() -> None:
     print(f"built {path.name}: {size / 1e6:.0f} MB in {time.time() - t0:.0f}s")
 
     client = genai.Client(api_key=key)
+    # Files-API budget (20 GB/project): wait for the collector to free inputs of finished jobs before uploading,
+    # so ALL shards can be dispatched at once and drain wave by wave unattended.
+    budget = int(float(os.environ.get("LLM_BATCH_FILES_BUDGET", "19.9e9")))
+    waited = 0
+    while True:
+        try:
+            active = sum(int(getattr(f, "size_bytes", 0) or 0) for f in client.files.list())
+        except Exception as exc:  # noqa: BLE001
+            print(f"files.list failed ({str(exc)[:80]}); assuming budget ok")
+            active = 0
+        if active + size <= budget:
+            break
+        if waited == 0:
+            print(f"Files budget: {active / 1e9:.1f} GB active + {size / 1e9:.2f} GB > {budget / 1e9:.1f} GB — waiting for collector")
+        if waited > 5 * 3600:
+            raise SystemExit("gave up waiting for Files-API budget after 5h")
+        time.sleep(120)
+        waited += 120
+    if waited:
+        print(f"budget freed after {waited // 60} min")
     t1 = time.time()
     up = client.files.upload(file=str(path), config=types.UploadFileConfig(display_name=path.name, mime_type="jsonl"))
     print(f"uploaded {up.name} in {time.time() - t1:.0f}s")

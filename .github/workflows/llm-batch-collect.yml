@@ -1,0 +1,39 @@
+name: llm-batch-collect
+
+# Generic: every 15 min, collect finished Gemini batch jobs of this project to blob and free their
+# Files-API inputs. Dormant unless repo variable LLM_BATCH_ACTIVE == "1" (or manual dispatch).
+# Only talks to Google + blob (a few API calls) — nothing touches the lease API.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      client:  { required: false, type: string, default: "" }
+      dataset: { required: false, type: string, default: "" }
+
+concurrency:
+  group: llm-batch-collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.LLM_BATCH_ACTIVE == '1' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet requests google-genai
+      - name: Collect finished batches -> blob
+        env:
+          LLM_BATCH_GEMINI_KEY: ${{ secrets.LLM_BATCH_GEMINI_KEY }}
+          MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+          MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}
+          PHASE2_SHOT_BLOB_SAS: ${{ secrets.PHASE2_SHOT_BLOB_SAS }}
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.client }}" ]; then ARGS="$ARGS --client ${{ inputs.client }}"; fi
+          if [ -n "${{ inputs.dataset }}" ]; then ARGS="$ARGS --dataset ${{ inputs.dataset }}"; fi
+          python tools/llm_batch_collect.py $ARGS
