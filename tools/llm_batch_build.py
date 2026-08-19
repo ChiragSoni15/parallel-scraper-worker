@@ -28,7 +28,9 @@ from io import BytesIO
 from pathlib import Path
 
 import requests
-from PIL import Image
+from PIL import Image, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # a few blob cards are truncated JPEGs; decode what is there
 
 
 def sas_query() -> str:
@@ -61,11 +63,14 @@ def fetch_resized(url: str, dim: int) -> bytes:
 
 
 def _fetch_or_none(url: str, dim: int, optional: bool) -> bytes | None:
+    """Never let one bad image sink a whole shard: missing optional images and undecodable images are dropped
+    (logged); only repeated transport failures on a required image still raise."""
     try:
         return fetch_resized(url, dim)
-    except RuntimeError:
-        if optional:
-            print(f"  optional image missing, dropped: {url.rsplit('/', 1)[-1]}")
+    except RuntimeError as exc:
+        msg = str(exc)
+        if optional or "truncated" in msg or "cannot identify" in msg or "decoder" in msg.lower() or "HTTP 404" in msg:
+            print(f"  image dropped ({'optional' if optional else 'undecodable/missing'}): {url.rsplit('/', 1)[-1]} :: {msg[-80:]}")
             return None
         raise
 
