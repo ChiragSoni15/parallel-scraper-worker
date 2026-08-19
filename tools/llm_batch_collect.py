@@ -65,6 +65,8 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"files.list failed: {str(exc)[:120]}")
     seen = collected = failed = 0
+    # A shard can be re-dispatched (new job, same display_name); only the NEWEST job per name is authoritative.
+    by_name: dict[str, list] = {}
     for job in client.batches.list():
         dn = getattr(job, "display_name", "") or ""
         parts = dn.split("/")
@@ -73,6 +75,11 @@ def main() -> None:
         cl, ds, shard = parts
         if (a.client and cl != a.client) or (a.dataset and ds != a.dataset):
             continue
+        by_name.setdefault(dn, []).append(job)
+    for dn, jobs in by_name.items():
+        jobs.sort(key=lambda j: str(getattr(j, "create_time", "")))
+        job = jobs[-1]
+        cl, ds, shard = dn.split("/")
         seen += 1
         try:  # list() omits src/dest/batch_stats; the full object has them
             job = client.batches.get(name=job.name)
@@ -84,6 +91,13 @@ def main() -> None:
         state = getattr(job.state, "name", str(job.state))
         src = files_by_display.get(f"{cl}_{ds}_{shard}.jsonl")  # None once deleted (=> stub input_deleted stays True below)
         stats = getattr(job, "batch_stats", None)
+        # A cancelled job reports SUCCEEDED with every request still pending and an empty responses file.
+        # Treat it as CANCELLED: no results written, keys go back to the pool on the next sync.
+        if state == "JOB_STATE_SUCCEEDED" and stats is not None:
+            rc = int(getattr(stats, "request_count", 0) or 0)
+            pc = int(getattr(stats, "pending_request_count", 0) or 0)
+            if rc and pc >= rc:
+                state = "JOB_STATE_CANCELLED"
         stub = {"client": cl, "dataset": ds, "shard": shard, "job": job.name, "display_name": dn, "state": state,
                 "model": getattr(job, "model", None), "src_file": src,
                 "create_time": str(getattr(job, "create_time", "") or ""),
