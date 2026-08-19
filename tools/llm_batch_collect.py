@@ -103,7 +103,11 @@ def main() -> None:
                 client.files.delete(name=src)
                 stub["input_deleted"] = True
             except Exception as exc:  # noqa: BLE001
-                stub["input_deleted"] = "404" in str(exc) or "not found" in str(exc).lower()
+                gone = "404" in str(exc) or "not found" in str(exc).lower()
+                stub["input_deleted"] = gone
+                if not gone:
+                    stub["input_delete_error"] = str(exc)[:300]
+                    print(f"  files.delete({src}) failed: {str(exc)[:200]}")
         blob_put(status_url, json.dumps(stub).encode("utf-8"), wq)
         print(f"{dn:48} {state:24} pending={stub['pending_request_count']} collected={'yes' if stub['results_url'] else 'no'} input_deleted={stub['input_deleted']}")
     print(json.dumps({"jobs_seen": seen, "newly_collected": collected, "failed": failed, "checked_at": now}))
