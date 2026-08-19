@@ -97,13 +97,16 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{a.client}_{a.dataset}_{a.shard}.jsonl"
     n_img = 0
-    with path.open("wb") as fh, ThreadPoolExecutor(max_workers=a.workers) as pool:
-        for i, sk in enumerate(skel, 1):
-            data, k = build_line(sk, a.send_dim, pool)
-            fh.write(data)
-            n_img += k
-            if i % 25 == 0:
-                print(f"  built {i}/{len(skel)} ({n_img} images, {path.stat().st_size / 1e6:.0f} MB, {time.time() - t0:.0f}s)", flush=True)
+    # Blob latency, not CPU, bounds the build: fan out across outlets (order preserved) and across each
+    # outlet's images. Groups of `workers` outlets keep memory bounded (~workers x outlet bytes).
+    with path.open("wb") as fh, ThreadPoolExecutor(max_workers=a.workers) as outlets,             ThreadPoolExecutor(max_workers=a.workers * 2) as images:
+        for g in range(0, len(skel), a.workers):
+            group = skel[g:g + a.workers]
+            for data, k in outlets.map(lambda sk: build_line(sk, a.send_dim, images), group):
+                fh.write(data)
+                n_img += k
+            i = min(g + a.workers, len(skel))
+            print(f"  built {i}/{len(skel)} ({n_img} images, {path.stat().st_size / 1e6:.0f} MB, {time.time() - t0:.0f}s)", flush=True)
     size = path.stat().st_size
     print(f"built {path.name}: {size / 1e6:.0f} MB in {time.time() - t0:.0f}s")
 
