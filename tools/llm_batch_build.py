@@ -130,26 +130,34 @@ def main() -> None:
     client = genai.Client(api_key=key)
     # Files-API budget (20 GB/project): wait for the collector to free inputs of finished jobs before uploading,
     # so ALL shards can be dispatched at once and drain wave by wave unattended.
-    budget = int(float(os.environ.get("LLM_BATCH_FILES_BUDGET", "19.9e9")))
+    # Concurrent runners all read the same "active" total, so the pre-check alone can overshoot Google's 20 GB cap;
+    # keep headroom AND treat a 429 on upload as "wait for the collector, then retry" rather than failing the shard.
+    budget = int(float(os.environ.get("LLM_BATCH_FILES_BUDGET", "17e9")))
     waited = 0
-    while True:
+    up = None
+    while up is None:
         try:
             active = sum(int(getattr(f, "size_bytes", 0) or 0) for f in client.files.list())
         except Exception as exc:  # noqa: BLE001
             print(f"files.list failed ({str(exc)[:80]}); assuming budget ok")
             active = 0
         if active + size <= budget:
-            break
-        if waited == 0:
-            print(f"Files budget: {active / 1e9:.1f} GB active + {size / 1e9:.2f} GB > {budget / 1e9:.1f} GB — waiting for collector")
+            t1 = time.time()
+            try:
+                up = client.files.upload(file=str(path), config=types.UploadFileConfig(display_name=path.name, mime_type="jsonl"))
+                break
+            except Exception as exc:  # noqa: BLE001
+                if "429" not in str(exc) and "RESOURCE_EXHAUSTED" not in str(exc):
+                    raise
+                print(f"upload 429 (Files quota) at active={active / 1e9:.1f} GB - waiting for collector to free inputs")
+        elif waited == 0:
+            print(f"Files budget: {active / 1e9:.1f} GB active + {size / 1e9:.2f} GB > {budget / 1e9:.1f} GB - waiting for collector")
         if waited > 5 * 3600:
             raise SystemExit("gave up waiting for Files-API budget after 5h")
-        time.sleep(120)
-        waited += 120
+        time.sleep(180)
+        waited += 180
     if waited:
         print(f"budget freed after {waited // 60} min")
-    t1 = time.time()
-    up = client.files.upload(file=str(path), config=types.UploadFileConfig(display_name=path.name, mime_type="jsonl"))
     print(f"uploaded {up.name} in {time.time() - t1:.0f}s")
     display = f"{a.client}/{a.dataset}/{a.shard}"
     job = client.batches.create(model=a.model, src=up.name, config=types.CreateBatchJobConfig(display_name=display))
