@@ -10,7 +10,7 @@ on:
       shards:        { required: true,  type: string, description: "comma-separated shard names, e.g. shard_001,shard_002" }
       skeleton_base: { required: true,  type: string, description: "blob URL prefix holding <shard>.jsonl (no SAS)" }
       model:         { required: true,  type: string, default: "gemini-3.7-flash" }
-      key_index:     { required: false, type: string, default: "", description: "1..8 -> secret LLM_BATCH_GEMINI_KEY_<n>; blank = LLM_BATCH_GEMINI_KEY" }
+      key_index:     { required: false, type: string, default: "", description: "1..11 -> secret LLM_BATCH_GEMINI_KEY_<n>; blank = LLM_BATCH_GEMINI_KEY" }
       send_dim:      { required: false, type: string, default: "1536" }
       max_parallel:  { required: false, type: string, default: "13" }
       collect:       { required: false, type: boolean, default: true,  description: "chain a collect job that polls until every shard is collected to blob" }
@@ -58,6 +58,9 @@ jobs:
           LLM_BATCH_GEMINI_KEY_6: ${{ secrets.LLM_BATCH_GEMINI_KEY_6 }}
           LLM_BATCH_GEMINI_KEY_7: ${{ secrets.LLM_BATCH_GEMINI_KEY_7 }}
           LLM_BATCH_GEMINI_KEY_8: ${{ secrets.LLM_BATCH_GEMINI_KEY_8 }}
+          LLM_BATCH_GEMINI_KEY_9: ${{ secrets.LLM_BATCH_GEMINI_KEY_9 }}
+          LLM_BATCH_GEMINI_KEY_10: ${{ secrets.LLM_BATCH_GEMINI_KEY_10 }}
+          LLM_BATCH_GEMINI_KEY_11: ${{ secrets.LLM_BATCH_GEMINI_KEY_11 }}
           MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
         run: |
           python tools/llm_batch_build.py \
@@ -99,6 +102,9 @@ jobs:
           LLM_BATCH_GEMINI_KEY_6: ${{ secrets.LLM_BATCH_GEMINI_KEY_6 }}
           LLM_BATCH_GEMINI_KEY_7: ${{ secrets.LLM_BATCH_GEMINI_KEY_7 }}
           LLM_BATCH_GEMINI_KEY_8: ${{ secrets.LLM_BATCH_GEMINI_KEY_8 }}
+          LLM_BATCH_GEMINI_KEY_9: ${{ secrets.LLM_BATCH_GEMINI_KEY_9 }}
+          LLM_BATCH_GEMINI_KEY_10: ${{ secrets.LLM_BATCH_GEMINI_KEY_10 }}
+          LLM_BATCH_GEMINI_KEY_11: ${{ secrets.LLM_BATCH_GEMINI_KEY_11 }}
           MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
           MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}
           PHASE2_SHOT_BLOB_SAS: ${{ secrets.PHASE2_SHOT_BLOB_SAS }}
