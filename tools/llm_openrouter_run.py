@@ -28,19 +28,20 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from llm_batch_build import _fetch_or_none, signed  # noqa: E402
+from llm_batch_build import _fetch_or_none, signed, shard_prompt, row_prompt  # noqa: E402
 
 API = "https://openrouter.ai/api/v1/chat/completions"
 FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.I)
 
 
-def build_messages(sk: dict, dim: int, pool: ThreadPoolExecutor) -> tuple[list, int]:
+def build_messages(sk: dict, dim: int, pool: ThreadPoolExecutor,
+                   template: str | None = None) -> tuple[list, int]:
     """OpenAI-style content blocks: the prompt, then every image as a data: URI."""
     urls = sk.get("images") or []
     optional = set(sk.get("optional_images") or [])
     imgs = [b for b in pool.map(lambda u: _fetch_or_none(u, dim, u in optional), urls)
             if b is not None]
-    content = [{"type": "text", "text": sk["prompt"]}]
+    content = [{"type": "text", "text": row_prompt(sk, template)}]
     for b in imgs:
         b64 = base64.b64encode(b).decode("ascii")
         content.append({"type": "image_url",
@@ -156,6 +157,7 @@ def main() -> None:
     r = requests.get(signed(a.skeleton_url), timeout=120)
     r.raise_for_status()
     rows = [json.loads(ln) for ln in r.text.splitlines() if ln.strip()]
+    template = None if all(x.get("prompt") for x in rows) else shard_prompt(a.skeleton_url)
     print(f"{a.shard}: {len(rows)} outlets -> {a.model}", flush=True)
 
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
@@ -168,7 +170,7 @@ def main() -> None:
          path.open("w", encoding="utf-8") as fh:
 
         def run(sk):
-            msgs, n = build_messages(sk, a.send_dim, images)
+            msgs, n = build_messages(sk, a.send_dim, images, template)
             res = call(msgs, a.model, key, sk.get("generation_config") or {})
             return {"key": sk["key"], "model": a.model, "n_images": n, **res}
 

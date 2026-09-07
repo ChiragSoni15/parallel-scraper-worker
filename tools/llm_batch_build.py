@@ -105,8 +105,37 @@ def _fetch_or_none(url: str, dim: int, optional: bool) -> bytes | None:
         raise
 
 
-def build_line(sk: dict, dim: int, pool: ThreadPoolExecutor) -> tuple[bytes, int]:
-    parts = [{"text": sk["prompt"]}]
+PROMPT_PLACEHOLDER = (
+    'name: "<outlet name>"\n'
+    'address: "<address>"\n'
+    'google_category: "<google category>"\n'
+    'rating: "<rating>"   reviews: "<review count>"   status: "<status>"')
+
+
+def shard_prompt(skeleton_url: str) -> str | None:
+    """Fetch <skeleton_base>/prompt.txt, the prompt stored ONCE per shard.
+
+    Repeating a 16 KB prompt on every row makes the skeleton for 716k outlets 11.5 GB
+    to upload from a laptop; stored once it is ~158 MB. The model still receives the
+    full prompt -- this is upload bandwidth, not tokens.
+    """
+    base = skeleton_url.rsplit("/", 1)[0]
+    r = requests.get(signed(f"{base}/prompt.txt"), timeout=60)
+    return r.text if r.status_code == 200 else None
+
+
+def row_prompt(sk: dict, template: str | None) -> str:
+    """Row carries either a full prompt (old shards) or just its metadata block."""
+    if sk.get("prompt"):
+        return sk["prompt"]
+    if not template:
+        raise SystemExit(f"row {sk.get(chr(39)+chr(107)+chr(101)+chr(121)+chr(39))} has no prompt and no shard prompt.txt")
+    return template.replace(PROMPT_PLACEHOLDER, sk.get("meta") or "", 1)
+
+
+def build_line(sk: dict, dim: int, pool: ThreadPoolExecutor,
+               template: str | None = None) -> tuple[bytes, int]:
+    parts = [{"text": row_prompt(sk, template)}]
     urls = sk.get("images") or []
     optional = set(sk.get("optional_images") or [])   # e.g. a listing screenshot: skip if gone, never fail the shard
     imgs = [b for b in pool.map(lambda u: _fetch_or_none(u, dim, u in optional), urls) if b is not None]
@@ -159,11 +188,17 @@ def main() -> None:
     ap.add_argument("--send-dim", type=int, default=1536)
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--out-dir", default="batch_out")
+    ap.add_argument("--key-index", default="", help="1..N -> LLM_BATCH_GEMINI_KEY_<n>")
     a = ap.parse_args()
 
-    key = os.environ.get("LLM_BATCH_GEMINI_KEY")
+    # One project per key: at Tier 3 the binding limit is 20 GB of Files API storage
+    # per project (~95k outlets), so a 716k run needs 8. --key-index selects which.
+    key = (os.environ.get(f"LLM_BATCH_GEMINI_KEY_{a.key_index}")
+           if a.key_index else None) or os.environ.get("LLM_BATCH_GEMINI_KEY")
     if not key:
-        raise SystemExit("LLM_BATCH_GEMINI_KEY missing")
+        raise SystemExit(f"no key: set LLM_BATCH_GEMINI_KEY_{a.key_index or 1} "
+                         f"or LLM_BATCH_GEMINI_KEY")
+    print(f"  using key slot {a.key_index or chr(39)+chr(39)} (len {len(key)})")
     from google import genai
     from google.genai import types
 
@@ -171,6 +206,7 @@ def main() -> None:
     r = requests.get(signed(a.skeleton_url), timeout=120)
     r.raise_for_status()
     skel = [json.loads(ln) for ln in r.text.splitlines() if ln.strip()]
+    template = None if all(x.get("prompt") for x in skel) else shard_prompt(a.skeleton_url)
     print(f"skeleton {a.shard}: {len(skel)} requests, {sum(len(s.get('images') or []) for s in skel)} images")
     gen0 = next((s.get("generation_config") for s in skel if s.get("generation_config")), None)
     if gen0:
@@ -189,7 +225,7 @@ def main() -> None:
     with path.open("wb") as fh, ThreadPoolExecutor(max_workers=a.workers) as outlets,             ThreadPoolExecutor(max_workers=a.workers * 2) as images:
         for g in range(0, len(skel), a.workers):
             group = skel[g:g + a.workers]
-            for data, k in outlets.map(lambda sk: build_line(sk, a.send_dim, images), group):
+            for data, k in outlets.map(lambda sk: build_line(sk, a.send_dim, images, template), group):
                 fh.write(data)
                 n_img += k
             i = min(g + a.workers, len(skel))
