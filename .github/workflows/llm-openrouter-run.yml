@@ -1,0 +1,67 @@
+name: llm-openrouter-run
+
+# Generic: run client-written skeleton shards against an OpenRouter model on the runner.
+# Same skeleton input as llm-batch-build, but OpenRouter has no Files API and no batch-job
+# object, so there is nothing to poll -- this workflow produces the results directly.
+# Manual dispatch only.
+on:
+  workflow_dispatch:
+    inputs:
+      client:        { required: true,  type: string, description: "client id, e.g. kwality" }
+      dataset:       { required: true,  type: string, description: "dataset id, e.g. bakeoff" }
+      shards:        { required: true,  type: string, description: "comma-separated shard names, e.g. shard_001,shard_002" }
+      skeleton_base: { required: true,  type: string, description: "blob URL prefix holding <shard>.jsonl (no SAS)" }
+      model:         { required: true,  type: string, default: "qwen/qwen3.8-flash", description: "OpenRouter model id" }
+      send_dim:      { required: false, type: string, default: "1536" }
+      workers:       { required: false, type: string, default: "4",  description: "outlets in flight per shard; raise only if the provider tolerates it" }
+      max_parallel:  { required: false, type: string, default: "13" }
+
+concurrency:
+  group: llm-openrouter-${{ inputs.client }}-${{ inputs.dataset }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python3 -c 'import json,os; print("matrix=" + json.dumps([s.strip() for s in os.environ["SHARDS"].split(",") if s.strip()]))' >> "$GITHUB_OUTPUT"
+
+  run:
+    needs: plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel) }}
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet requests pillow
+      - name: Self-check (no network)
+        run: python tools/llm_openrouter_run.py --selftest
+      - name: Fetch images + call OpenRouter
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+        run: |
+          python tools/llm_openrouter_run.py \
+            --skeleton-url "${{ inputs.skeleton_base }}/${{ matrix.shard }}.jsonl" \
+            --client "${{ inputs.client }}" --dataset "${{ inputs.dataset }}" --shard "${{ matrix.shard }}" \
+            --model "${{ inputs.model }}" --send-dim "${{ inputs.send_dim }}" \
+            --workers "${{ inputs.workers }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ inputs.client }}-${{ inputs.dataset }}-${{ matrix.shard }}
+          path: batch_out/*.results.jsonl
+          retention-days: 7
