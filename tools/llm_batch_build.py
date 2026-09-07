@@ -40,7 +40,20 @@ def sas_query() -> str:
     return sas.split("?", 1)[1] if "?" in sas else sas.lstrip("?")
 
 
+BLOB_HOST = ".blob.core.windows.net"
+
+
 def signed(url: str) -> str:
+    """SAS only belongs on our blob URLs.
+
+    Skeletons can now mix blob URLs (screenshots) with public CDN URLs (Google photos
+    and Street View), because photos for some clients were never downloaded to blob.
+    Appending a SAS to those is wrong twice over: it is a pointless query on lh3, and
+    Street View URLs already carry "?panoid=", so a second "?" makes them malformed and
+    every photo silently fails -- leaving a vision run that saw only screenshots.
+    """
+    if BLOB_HOST not in url:
+        return url
     return url if "sig=" in url else f"{url}?{sas_query()}"
 
 
