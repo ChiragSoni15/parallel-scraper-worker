@@ -78,6 +78,12 @@ def fetch_resized(url: str, dim: int) -> bytes:
                 im.save(buf, "JPEG", quality=90)
                 return buf.getvalue()
             last = f"HTTP {r.status_code}"
+            # A 4xx will not become a 200 on retry. Screenshot URLs are now derived
+            # rather than looked up, so ~55% of them legitimately 404; retrying each
+            # one four times with backoff would add ~20s per missing screenshot and
+            # dominate the whole build.
+            if 400 <= r.status_code < 500:
+                break
         except Exception as exc:  # noqa: BLE001
             last = str(exc)[:120]
         time.sleep(2 * (attempt + 1))
