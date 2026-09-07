@@ -21,6 +21,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -90,8 +91,16 @@ def _fetch_or_none(url: str, dim: int, optional: bool) -> bytes | None:
         return fetch_resized(url, dim)
     except RuntimeError as exc:
         msg = str(exc)
-        if optional or "truncated" in msg or "cannot identify" in msg or "decoder" in msg.lower() or "HTTP 404" in msg:
-            print(f"  image dropped ({'optional' if optional else 'undecodable/missing'}): {url.rsplit('/', 1)[-1]} :: {msg[-80:]}")
+        # A 4xx from a public CDN is a dead photo, not a broken run: Google image URLs
+        # expire (the gps-proxy ones 403 within days of a scrape), and one stale URL in
+        # a 100-outlet shard must not fail every outlet in it.
+        # A 4xx on OUR blob is different -- that means a bad or expired SAS, a config
+        # error we want loud rather than silently missing screenshots.
+        cdn_gone = BLOB_HOST not in url and re.search(r"HTTP 4\d\d", msg) is not None
+        if (optional or cdn_gone or "truncated" in msg or "cannot identify" in msg
+                or "decoder" in msg.lower() or "HTTP 404" in msg):
+            why = "optional" if optional else "expired CDN url" if cdn_gone else "undecodable/missing"
+            print(f"  image dropped ({why}): {url.rsplit('/', 1)[-1][:60]} :: {msg[-60:]}")
             return None
         raise
 
