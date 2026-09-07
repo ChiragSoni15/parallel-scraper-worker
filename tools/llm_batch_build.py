@@ -116,6 +116,39 @@ def build_line(sk: dict, dim: int, pool: ThreadPoolExecutor) -> tuple[bytes, int
     return (json.dumps({"key": sk["key"], "request": req}, ensure_ascii=False) + "\n").encode("utf-8"), len(imgs)
 
 
+def normalise_thinking(model: str, gen: dict, key: str) -> dict:
+    """Make one model-agnostic skeleton work on any Gemini model.
+
+    The thinking control is not portable and the mismatch is silent until collection:
+    a whole batch comes back as {"code": 3, "invalid argument"} with nothing usable.
+      gemini-3.1-flash-lite: thinkingBudget=0 -> 0 thoughts; thinkingLevel=low -> 116
+      gemini-3.5-flash-lite: thinkingBudget=0 -> HTTP 400;   thinkingLevel=low -> 0
+    So probe once per shard with a trivial request and swap the field if rejected,
+    rather than hardcoding a model list that the next release invalidates.
+    """
+    tc = (gen or {}).get("thinkingConfig")
+    if not tc:
+        return gen
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    probe = {"contents": [{"parts": [{"text": "hi"}]}], "generationConfig": gen}
+    r = requests.post(url, headers={"x-goog-api-key": key}, json=probe, timeout=60)
+    if r.status_code == 200:
+        return gen
+    alt = dict(gen)
+    if "thinkingBudget" in tc:
+        alt["thinkingConfig"] = {"thinkingLevel": "low"}
+    elif "thinkingLevel" in tc:
+        alt["thinkingConfig"] = {"thinkingBudget": 0}
+    else:
+        raise SystemExit(f"{model} rejected generationConfig and no thinking swap applies: {r.text[:200]}")
+    probe["generationConfig"] = alt
+    r2 = requests.post(url, headers={"x-goog-api-key": key}, json=probe, timeout=60)
+    if r2.status_code != 200:
+        raise SystemExit(f"{model} rejects both thinking forms: {r2.text[:200]}")
+    print(f"  thinkingConfig {tc} rejected by {model}; using {alt['thinkingConfig']}")
+    return alt
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--skeleton-url", required=True)
@@ -139,6 +172,13 @@ def main() -> None:
     r.raise_for_status()
     skel = [json.loads(ln) for ln in r.text.splitlines() if ln.strip()]
     print(f"skeleton {a.shard}: {len(skel)} requests, {sum(len(s.get('images') or []) for s in skel)} images")
+    gen0 = next((s.get("generation_config") for s in skel if s.get("generation_config")), None)
+    if gen0:
+        fixed = normalise_thinking(a.model, gen0, key)
+        if fixed is not gen0:
+            for s in skel:
+                if s.get("generation_config"):
+                    s["generation_config"] = fixed
 
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
