@@ -57,11 +57,19 @@ def signed(url: str) -> str:
     return url if "sig=" in url else f"{url}?{sas_query()}"
 
 
+# Street View thumbnails 403 the requests default User-Agent; a browser UA is enough.
+# Without it every streetviewpixels image is dropped by _fetch_or_none and outlets whose
+# only imagery is Street View reach the model with no images at all.
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/140.0 Safari/537.36")
+FETCH_HEADERS = {"User-Agent": UA, "Referer": "https://www.google.com/maps/"}
+
+
 def fetch_resized(url: str, dim: int) -> bytes:
     last = None
     for attempt in range(4):
         try:
-            r = requests.get(signed(url), timeout=60)
+            r = requests.get(signed(url), timeout=60, headers=FETCH_HEADERS)
             if r.status_code == 200:
                 im = Image.open(BytesIO(r.content)).convert("RGB")
                 im.thumbnail((dim, dim))
