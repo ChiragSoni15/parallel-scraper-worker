@@ -69,6 +69,14 @@ def extract_json(text: str) -> dict | None:
 def call(messages: list, model: str, key: str, gen: dict, tries: int = 4) -> dict:
     body = {"model": model, "messages": messages,
             "temperature": gen.get("temperature", 0), "top_p": gen.get("topP", 1)}
+    # The skeleton disables thinking the Gemini way (thinkingConfig.thinkingBudget);
+    # OpenRouter ignores that field, so translate it. This is not an optimisation:
+    # Qwen3.8 Flash defaults to reasoning and will spend the WHOLE completion budget
+    # thinking, returning content=None for every outlet while still billing. Measured:
+    # default 60/60 tokens reasoning + no content; enabled=false 5 tokens + valid JSON,
+    # 5.6x cheaper. "exclude" only hides the reasoning, it still burns it.
+    if (gen.get("thinkingConfig") or {}).get("thinkingBudget") == 0:
+        body["reasoning"] = {"enabled": False}
     if gen.get("maxOutputTokens"):
         body["max_tokens"] = gen["maxOutputTokens"]
     if gen.get("responseSchema"):        # honoured by models that enforce schemas
