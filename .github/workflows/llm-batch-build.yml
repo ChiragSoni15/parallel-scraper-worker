@@ -9,7 +9,7 @@ on:
       dataset:       { required: true,  type: string, description: "dataset id, e.g. riyadh" }
       shards:        { required: true,  type: string, description: "comma-separated shard names, e.g. shard_001,shard_002" }
       skeleton_base: { required: true,  type: string, description: "blob URL prefix holding <shard>.jsonl (no SAS)" }
-      model:         { required: true,  type: string, default: "gemini-3.7-flash" }
+      model:         { required: true,  type: string, default: "gemini-3.5-flash-lite" }
       key_index:     { required: false, type: string, default: "", description: "1..21 -> secret LLM_BATCH_GEMINI_KEY_<n>; blank = LLM_BATCH_GEMINI_KEY" }
       send_dim:      { required: false, type: string, default: "1536" }
       max_parallel:  { required: false, type: string, default: "13" }
