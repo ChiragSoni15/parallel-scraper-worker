@@ -1008,7 +1008,12 @@ async def extract_latest_review_date(page: Page) -> str:
             except Exception:
                 pass
         if sort_clicked:
-            await page.wait_for_timeout(500)
+            # wait for the menu to render instead of a fixed 0.5 s: on a busy runner it took longer, every "Newest"
+            # selector missed and the list stayed in "Most relevant" order (A/B test, 6-Oct-2026)
+            try:
+                await page.wait_for_selector('[role="menuitemradio"]', state="visible", timeout=3000)
+            except PlaywrightTimeout:
+                pass
             # The Sort menu wraps the label text "Newest" inside a child div
             # (<div class="mLuXec">Newest</div>) that does NOT receive pointer
             # events — the outer <div role="menuitemradio"> does. Clicking the
