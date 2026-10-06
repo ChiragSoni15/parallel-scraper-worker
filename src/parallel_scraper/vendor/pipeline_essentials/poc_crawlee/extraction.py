@@ -1068,6 +1068,10 @@ async def extract_latest_review_date(page: Page) -> str:
                     if _AGE_ONLY_RE.match(t):
                         texts.append(t)
         newest = most_recent_age(texts)
+        # TEMP debug for the 6-Oct A/B test -- remove before merge
+        logger.warning("RDDEBUG url=%s sort=%s already=%s newest_clicked=%s cards_before=%s dates=%d first=%r newest=%r",
+                       page.url[:90], locals().get("sort_clicked"), locals().get("already"), locals().get("newest_clicked"),
+                       len(locals().get("before") or []), len(texts), texts[0] if texts else None, newest)
         if newest:
             return _clean(newest)
     except Exception as e:
