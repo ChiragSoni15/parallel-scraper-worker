@@ -649,21 +649,33 @@ async () => {
     r.latest_review_date = 'N/A';
     const reviewEls = document.querySelectorAll('span.rsqaWe');
     if (reviewEls.length > 0) {
-        r.latest_review_date = reviewEls[0].textContent.trim();
+        // the MOST RECENT of the loaded reviews, not the first: the overview lists them in "Most relevant" order
+        // (Farmer's Fresh, 6-Oct-2026: first = "3 years ago", newest = "a year ago")
+        const ageRe = /(\\d+|an?)\\s+(minute|hour|day|week|month|year)s?\\s+ago/i;
+        const mins = { minute: 1, hour: 60, day: 1440, week: 10080, month: 43200, year: 525600 };
+        let best = Infinity;
+        for (const el of reviewEls) {
+            const t = el.textContent.trim(), m = t.match(ageRe);
+            if (!m) continue;
+            const v = (/^an?$/i.test(m[1]) ? 1 : parseInt(m[1])) * mins[m[2].toLowerCase()];
+            if (v < best) { best = v; r.latest_review_date = t; }
+        }
+        if (r.latest_review_date === 'N/A') r.latest_review_date = reviewEls[0].textContent.trim();
     } else {
         // Fallback: look for relative time patterns in review sections
         const reviewSection = document.querySelectorAll('div.jftiEf, div.GHT2ce');
+        // date-only spans ("a year ago", "Edited 3 months ago"), the most recent -- not the first span that mentions a
+        // time ("visited a week ago" in review text); Codex review, 6-Oct-2026
+        const onlyRe = /^(edited\\s+)?(\\d+|an?)\\s+(minute|hour|day|week|month|year)s?\\s+ago$/i;
+        const mins2 = { minute: 1, hour: 60, day: 1440, week: 10080, month: 43200, year: 525600 };
+        let best2 = Infinity;
         for (const rev of reviewSection) {
-            const spans = rev.querySelectorAll('span');
-            for (const sp of spans) {
-                const t = sp.textContent.trim();
-                if (/\\d+\\s+(day|week|month|year|hour|minute)s?\\s+ago/i.test(t)
-                    || /a\\s+(day|week|month|year)\\s+ago/i.test(t)) {
-                    r.latest_review_date = t;
-                    break;
-                }
+            for (const sp of rev.querySelectorAll('span')) {
+                const t = sp.textContent.trim(), m = t.match(onlyRe);
+                if (!m) continue;
+                const v = (/^an?$/i.test(m[2]) ? 1 : parseInt(m[2])) * mins2[m[3].toLowerCase()];
+                if (v < best2) { best2 = v; r.latest_review_date = t; }
             }
-            if (r.latest_review_date !== 'N/A') break;
         }
     }
     // Final fallback: APP_INITIALIZATION_STATE — keep the most recent "X ago" string
@@ -894,10 +906,37 @@ async def extract_about(page: Page) -> str:
 
 
 
+_AGE_RE = re.compile(r"(\d+|an?)\s+(minute|hour|day|week|month|year)s?\s+ago", re.I)
+_AGE_MIN = {"minute": 1, "hour": 60, "day": 1440, "week": 10080, "month": 43200, "year": 525600}
+# a span that is ONLY a review date ("a year ago", "Edited 3 months ago"), not review text that mentions one
+_AGE_ONLY_RE = re.compile(r"^(edited\s+)?(\d+|an?)\s+(minute|hour|day|week|month|year)s?\s+ago$", re.I)
+# visible review cards as [review id, date] pairs; the id tells two reviews with the same date apart
+_CARDS_JS = """() => [...document.querySelectorAll('div.jftiEf')].filter(e => e.getClientRects().length)
+    .map(e => [e.dataset.reviewId || e.getAttribute('data-review-id') || '',
+               (e.querySelector('span.rsqaWe')?.textContent || '').trim()])"""
+_NEWEST_CHECKED_JS = """() => [...document.querySelectorAll('[role="menuitemradio"]')]
+    .some(e => /Newest/i.test(e.textContent) && e.getAttribute('aria-checked') === 'true')"""
+
+
+def most_recent_age(texts) -> str:
+    """The text with the smallest "N <unit> ago" among texts ("Edited a year ago" counts), else ""."""
+    best, out = None, ""
+    for t in texts:
+        m = _AGE_RE.search(t or "")
+        if m:
+            v = (1 if m[1].lower() in ("a", "an") else int(m[1])) * _AGE_MIN[m[2].lower()]
+            if best is None or v < best:
+                best, out = v, t.strip()
+    return out
+
+
+
 async def extract_latest_review_date(page: Page) -> str:
     """
-    Click Reviews tab, Sort > Newest, then read first review date.
-    Default sort is 'Most relevant' — must sort by Newest to get latest.
+    Click Reviews tab, Sort > Newest (skipped when already selected), wait for the cards to re-render, then return the
+    MOST RECENT date among the loaded reviews. Default sort is 'Most relevant' -- reading only the first review there
+    stored stale dates (Farmer's Fresh, 6-Oct-2026: "3 years ago" vs newest "a year ago"). If the sort cannot be
+    verified the most recent loaded date is still the best guess, and is returned (owner, 6-Oct-2026).
     All fallback clicks use short timeouts (3s) to avoid 30s Playwright default hangs.
     """
     try:
@@ -975,13 +1014,19 @@ async def extract_latest_review_date(page: Page) -> str:
             # events — the outer <div role="menuitemradio"> does. Clicking the
             # text node fails with "intercepts pointer events". Target the
             # menuitemradio role directly.
+            # Newest already selected -> nothing to re-sort, so no wait (Codex review, 6-Oct-2026)
+            already = await page.evaluate(_NEWEST_CHECKED_JS)
+            if already:
+                await page.keyboard.press("Escape")
+            # the review cards as they are now, to tell when the Newest order has rendered
+            before = await page.evaluate(_CARDS_JS)
             newest_clicked = False
-            for sel in [
+            for sel in ([] if already else [
                 'div[role="menuitemradio"]:has-text("Newest")',
                 'li[role="menuitemradio"]:has-text("Newest")',
                 'button[role="menuitemradio"]:has-text("Newest")',
                 '[role="menuitemradio"][data-index="1"]',
-            ]:
+            ]):
                 try:
                     el = await page.query_selector(sel)
                     if el and await el.is_visible():
@@ -990,35 +1035,41 @@ async def extract_latest_review_date(page: Page) -> str:
                         break
                 except Exception:
                     continue
-            if not newest_clicked:
+            if not newest_clicked and not already:
                 try:
                     await page.get_by_role("menuitemradio", name="Newest").first.click(timeout=2000)
                     newest_clicked = True
                 except Exception:
                     pass
-            if not newest_clicked:
+            if not newest_clicked and not already:
                 try:
                     await page.get_by_text("Newest", exact=True).first.click(timeout=2000, force=True)
                     newest_clicked = True
                 except Exception:
                     pass
             if newest_clicked:
-                await page.wait_for_timeout(1500)
+                # wait until the review cards are re-rendered in Newest order (non-empty and different), instead of a
+                # fixed 1.5 s; on timeout keep the best guess below (owner, 6-Oct-2026)
+                try:
+                    await page.wait_for_function(
+                        f"b => {{ const now = ({_CARDS_JS})(); return now.length > 0 && JSON.stringify(now) !== JSON.stringify(b); }}",
+                        arg=before, timeout=5000)
+                except PlaywrightTimeout:
+                    pass
 
-        # 3. Extract first review date
-        review_el = await page.query_selector("span.rsqaWe")
-        if review_el:
-            return _clean(await review_el.inner_text())
-        for rev in await page.query_selector_all("div.jftiEf, div.GHT2ce"):
-            for span in await rev.query_selector_all("span"):
-                t = await span.inner_text()
-                t = (t or "").strip()
-                if re.search(
-                    r"\d+\s+(day|week|month|year|hour|minute)s?\s+ago|a\s+(day|week|month|year)\s+ago",
-                    t,
-                    re.I,
-                ):
-                    return _clean(t)
+        # 3. The MOST RECENT date among the loaded reviews, not the first one. If the Newest click did not take (or the
+        # list had not re-rendered within the wait) the first review is still the "Most relevant" one -- Farmer's
+        # Fresh, 6-Oct-2026: stored "3 years ago", newest "a year ago". The min is right either way.
+        texts = [t.strip() for t in await page.eval_on_selector_all("span.rsqaWe", "els => els.map(e => e.textContent)")]
+        if not texts:
+            for rev in await page.query_selector_all("div.jftiEf, div.GHT2ce"):
+                for span in await rev.query_selector_all("span"):
+                    t = ((await span.inner_text()) or "").strip()
+                    if _AGE_ONLY_RE.match(t):
+                        texts.append(t)
+        newest = most_recent_age(texts)
+        if newest:
+            return _clean(newest)
     except Exception as e:
         logger.debug("extract_latest_review_date: %s", e)
     return "N/A"
@@ -1231,7 +1282,7 @@ async def extract_all(page: Page, url: str, config=None, place_id: Optional[str]
     # the Reviews tab and explicitly Sort > Newest when reviews exist —
     # overwriting whatever EXTRACT_JS read.
     try:
-        rc = int(place.review_count or "0")
+        rc = int(str(place.review_count or "0").replace(",", ""))
     except (TypeError, ValueError):
         rc = 0
     if rc > 0:
