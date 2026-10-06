@@ -943,7 +943,7 @@ async def extract_latest_review_date(page: Page) -> str:
             best = most_recent_age([best, got]) or best
         if info.get("verified"):
             break
-        logger.warning("RDDEBUG retry attempt=%d info=%s got=%r", attempt, info, got)   # TEMP: back to logger.info before merge
+        logger.info("latest_review_date: not verified (attempt %d): %s", attempt, info)
         if attempt == 1:
             await page.wait_for_timeout(1500)
     return best or "N/A"
@@ -1097,10 +1097,7 @@ async def _latest_review_date_once(page: Page, info: dict) -> str:
                     if _AGE_ONLY_RE.match(t):
                         texts.append(t)
         newest = most_recent_age(texts)
-        # TEMP debug for the 6-Oct A/B test -- remove before merge
-        logger.warning("RDDEBUG url=%s sort=%s already=%s newest_clicked=%s cards_before=%s dates=%d first=%r newest=%r",
-                       page.url[:90], locals().get("sort_clicked"), locals().get("already"), locals().get("newest_clicked"),
-                       len(locals().get("before") or []), len(texts), texts[0] if texts else None, newest)
+        info["dates"] = len(texts)
         if newest:
             return _clean(newest)
     except Exception as e:
