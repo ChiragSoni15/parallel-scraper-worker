@@ -932,7 +932,27 @@ def most_recent_age(texts) -> str:
 
 
 async def extract_latest_review_date(page: Page) -> str:
+    """Up to two tries: a busy runner sometimes has the Reviews tab or the Sort menu not rendered yet, and then the
+    list stays in "Most relevant" order (A/B test, 6-Oct-2026). The second try runs only when the first could not
+    verify the Newest sort; the most recent date of the two tries is kept."""
+    best = ""
+    for attempt in (1, 2):
+        info: dict = {}
+        got = await _latest_review_date_once(page, info)
+        if got != "N/A":
+            best = most_recent_age([best, got]) or best
+        if info.get("verified"):
+            break
+        logger.warning("RDDEBUG retry attempt=%d info=%s got=%r", attempt, info, got)   # TEMP: back to logger.info before merge
+        if attempt == 1:
+            await page.wait_for_timeout(1500)
+    return best or "N/A"
+
+
+async def _latest_review_date_once(page: Page, info: dict) -> str:
     """
+    One try. info gets tab (Reviews tab opened), tabs (tab labels seen, when it was not), verified (Newest sort
+    clicked or already selected).
     Click Reviews tab, Sort > Newest (skipped when already selected), wait for the cards to re-render, then return the
     MOST RECENT date among the loaded reviews. Default sort is 'Most relevant' -- reading only the first review there
     stored stale dates (Farmer's Fresh, 6-Oct-2026: "3 years ago" vs newest "a year ago"). If the sort cannot be
@@ -983,7 +1003,10 @@ async def extract_latest_review_date(page: Page) -> str:
                 clicked_reviews = True
             except Exception:
                 pass
+        info["tab"] = clicked_reviews
         if not clicked_reviews:
+            info["tabs"] = await page.eval_on_selector_all(
+                'button[role="tab"]', "els => els.map(e => e.getAttribute('aria-label') || e.textContent.trim())")
             return "N/A"
 
         # Wait for reviews content to appear
@@ -1062,6 +1085,7 @@ async def extract_latest_review_date(page: Page) -> str:
                 except PlaywrightTimeout:
                     pass
 
+        info["verified"] = bool(sort_clicked and (already or newest_clicked))
         # 3. The MOST RECENT date among the loaded reviews, not the first one. If the Newest click did not take (or the
         # list had not re-rendered within the wait) the first review is still the "Most relevant" one -- Farmer's
         # Fresh, 6-Oct-2026: stored "3 years ago", newest "a year ago". The min is right either way.
@@ -1080,7 +1104,8 @@ async def extract_latest_review_date(page: Page) -> str:
         if newest:
             return _clean(newest)
     except Exception as e:
-        logger.debug("extract_latest_review_date: %s", e)
+        info["error"] = f"{type(e).__name__}: {str(e)[:120]}"
+        logger.info("extract_latest_review_date: %s", e)
     return "N/A"
 
 
