@@ -91,6 +91,12 @@ def item_kind(item: dict) -> str:
     return "unknown"
 
 
+def is_menu_item(item: dict) -> bool:
+    """Walked from the gallery's "Menu" chip (horeca_capture tags chip="Menu"): a menu
+    photo, never a gallery candidate. Cheap signal only; no model call."""
+    return (item.get("chip") or "").lower() == "menu"
+
+
 def kind_counts(items) -> dict:
     """Counts of walked items that selection skips (videos, 360, unknown)."""
     out = {"video_count": 0, "pano_count": 0, "unknown_count": 0}
@@ -164,7 +170,7 @@ def select_photos(items, *, now, cap: int = 20, thresh: int = 8,
     photos: list[dict] = []
     by_base: dict[str, dict] = {}
     for it in sorted(items, key=lambda i: i.get("ordinal", 0)):
-        if item_kind(it) != "photo" or not it.get("url"):
+        if item_kind(it) != "photo" or not it.get("url") or is_menu_item(it):
             continue
         g = {"url": it["url"], "base": it["url"].split("=")[0],
              "sources": set(it.get("sources") or [it.get("source") or "gallery"]),
@@ -228,37 +234,59 @@ def _to_selected(g: dict, band: str) -> Selected:
                     band=band)
 
 
+def _ok(o) -> bool:
+    return o.get("status") in ("written", "exists")
+
+
 def summary(items, selected, walk_meta: dict, outcomes=None) -> dict:
     """`$.photo_dates.summary` (§4.3).
 
     walk_meta: walk_ok, reason, owner_count_known, limits_hit (list), chip_unavailable,
-    optional latest_ordered. outcomes: mirror_selected() results for the selected
-    items plus Street View; when given, photos_selected/photos_mirrored count them.
+    optional latest_ordered. outcomes: mirror_selected() results, one per `selected`
+    item in order. photos_selected/photos_mirrored count GALLERY photos only; the
+    Street View item (source street_view) is counted in sv_selected/sv_mirrored, so a
+    failed Street View fetch never breaks the completeness predicate.
     """
     limits = list(walk_meta.get("limits_hit") or [])
     walk_ok = bool(walk_meta.get("walk_ok", True))
+    sel = list(selected or [])
+    pairs = list(zip(sel, outcomes)) if outcomes is not None else [(x, None) for x in sel]
+    sv = [o for x, o in pairs if getattr(x, "source", "") == "street_view"]
+    gal = [o for x, o in pairs if getattr(x, "source", "") != "street_view"]
+    reasons = walk_meta.get("truncated_reasons") or []
+    latest = walk_meta.get("latest_ordered")
     out = {
-        "photos_walked": sum(1 for it in items if item_kind(it) == "photo"),
-        "photos_selected": len(outcomes) if outcomes is not None else len(selected),
-        "photos_mirrored": sum(1 for o in (outcomes or [])
-                               if o.get("status") in ("written", "exists")),
+        "photos_walked": sum(1 for it in items if item_kind(it) == "photo" and not is_menu_item(it)),
+        "photos_selected": len(gal),
+        "photos_mirrored": sum(1 for o in gal if o is not None and _ok(o)),
+        "sv_selected": len(sv),
+        "sv_mirrored": sum(1 for o in sv if o is not None and _ok(o)),
+        "no_street_view": int(not sv),
+        "menu_skipped": sum(1 for it in items if item_kind(it) == "photo" and is_menu_item(it)),
         "walk_ok": walk_ok,
         "owner_count_known": bool(walk_meta.get("owner_count_known", False)),
-        "truncated": 1 if limits or walk_meta.get("truncated") else 0,
+        "truncated": 1 if limits or reasons or walk_meta.get("truncated") else 0,
         "limits_hit": limits,
-        "latest_ordered": walk_meta.get("latest_ordered", _latest_ordered(items)),
+        "truncated_reasons": list(reasons),
+        # The key is always present in walk_meta (None until set), so fall through on None.
+        "latest_ordered": latest if latest is not None else _ordered(items, ("latest",)),
+        "stream_ordered": _ordered(items, ("all", "")),
         "chip_unavailable": 1 if walk_meta.get("chip_unavailable") else 0,
+        # degraded session render (10-tile preview, no chips): a fresh browser fixes it
+        "degraded_gallery": int(bool(walk_meta.get("degraded_gallery"))),
     }
     if not walk_ok:
         out["reason"] = walk_meta.get("reason")
     return out
 
 
-def _latest_ordered(items) -> int | None:
-    """1 when the dated items of the Latest walk are non-increasing in walk order."""
+def _ordered(items, chips) -> int | None:
+    """1 when the dated items walked under `chips` (lower case; "" = the open stream
+    with no chip) are newest-first in walk order, else 0; None = no dated item.
+    Latest -> latest_ordered; All / no chip (relevance order) -> stream_ordered."""
     months = [parse_photo_month(it.get("caption"))
               for it in sorted(items, key=lambda i: i.get("ordinal", 0))
-              if (it.get("chip") or "").lower() == "latest"]
+              if (it.get("chip") or "").lower() in chips]
     months = [m for m in months if m]
     if not months:
         return None

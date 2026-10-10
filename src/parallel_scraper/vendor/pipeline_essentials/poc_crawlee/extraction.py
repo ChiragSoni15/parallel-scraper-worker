@@ -1034,8 +1034,9 @@ async def _latest_review_date_once(page: Page, info: dict, review_count: Optiona
     stored stale dates (Farmer's Fresh, 6-Oct-2026: "3 years ago" vs newest "a year ago"). If the sort cannot be
     verified the most recent loaded date is still the best guess, and is returned (owner, 6-Oct-2026).
     All fallback clicks use short timeouts (3s) to avoid 30s Playwright default hangs.
-    verified (§8.5) = Newest was already selected, or Newest was clicked AND the cards re-rendered. No Sort control:
-    verified when 1 <= review_count <= 10 and the distinct cards on screen >= review_count, every card date parseable.
+    verified (§8.5) = Newest was already selected, or Newest was clicked AND the cards re-rendered. Otherwise (Sort
+    control or not): verified when 1 <= review_count <= 10 and the distinct cards on screen >= review_count, every card
+    date parseable.
     """
     try:
         # 0. Wait for tab buttons to render (lazy-loaded on some pages)
@@ -1169,10 +1170,22 @@ async def _latest_review_date_once(page: Page, info: dict, review_count: Optiona
                     rerendered = True
                 except PlaywrightTimeout:
                     pass
+            # p10: on 6 of 10 outlets the Newest click missed and the Sort menu stayed open (dimmed reviews
+            # screenshot); the open menu then blocked the Overview click (no overview shot) and the gallery chips
+            # (chips_seen=[] on the same 6). Close it whenever it is still open.
+            try:
+                if await page.locator('[role="menuitemradio"]').first.is_visible():
+                    info["menu_left_open"] = True
+                    await page.keyboard.press("Escape")
+            except Exception:
+                pass
 
         info["verified"] = bool(sort_clicked and (already or (newest_clicked and rerendered)))
-        if no_sort and not sort_clicked and review_count is not None and 1 <= review_count <= 10:
-            # §8.5 no-Sort rule: every review is on screen, so the max over the cards is the newest
+        if not info["verified"] and review_count is not None and 1 <= review_count <= 10:
+            # §8.5 all-cards rule: every review is on screen, so the max over the cards is the newest, whatever the
+            # sort. p10: Maps shows Sort even at 1-2 reviews, where Newest re-renders identical cards (no change to
+            # wait for); requiring "no Sort control" left 4 of 10 small outlets unverified.
+            info["no_sort"] = no_sort
             cards = {(cid or date): date for cid, date in await page.evaluate(_CARDS_JS)}
             info["no_sort_cards"] = len(cards)
             info["verified"] = (len(cards) >= review_count

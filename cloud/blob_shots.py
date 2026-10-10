@@ -28,6 +28,7 @@ import hashlib
 import io
 import logging
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -264,15 +265,39 @@ def _source_url(item) -> str:
     return item.url.split("=")[0] + "=s1600"
 
 
+# streetviewpixels answers 403 PERMISSION_DENIED to the python-requests User-Agent
+# (any size, with or without Referer); a browser UA gets 200 (checked live, Oct 2026).
+_SV_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+               "Referer": "https://www.google.com/"}
+
+
+def _sv_urls(url: str) -> list[str]:
+    """The Street View URL as given, then at w=1200 (h kept in proportion 4:3)."""
+    out = [url]
+    if "streetviewpixels" in url:
+        alt = re.sub(r"([?&])h=\d+", r"\1h=900", re.sub(r"([?&])w=\d+", r"\1w=1200", url))
+        if alt != url:
+            out.append(alt)
+    return out
+
+
+def _sv_get(url: str) -> bytes | None:
+    r = requests.get(url, headers=_SV_HEADERS, timeout=_PHOTO_GET_TIMEOUT_S)
+    return r.content if r.status_code == 200 and r.content else None
+
+
 def mirror_selected(run_id: str, place_id: str, selected, *, fetch=None, put=None,
-                    resize=None, pool_workers: int = _PHOTO_POOL_WORKERS) -> list[dict]:
+                    resize=None, pool_workers: int = _PHOTO_POOL_WORKERS,
+                    sv_fetch=None) -> list[dict]:
     """Mirror selected photos (gallery_select.Selected, plus the Street View item)
     to ``photos/<pid>/<sha1>.jpg``; one outcome per item, in input order (§4.1):
     {ordinal, blob_name, sha1, width, height, bytes, status}, ordinal = selection
     index, status written | exists | failed.
 
     Injected for tests: fetch(url) -> bytes | None; put(name, body, meta) ->
-    'written' | 'exists' (raise on failure); resize(bytes) -> (bytes, w, h).
+    'written' | 'exists' (raise on failure); resize(bytes) -> (bytes, w, h);
+    sv_fetch(url) -> bytes | None, the Street View fallback (browser headers) tried on
+    the URL as given and then at w=1200 when `fetch` returns nothing.
     """
     if fetch is None:
         def fetch(url):
@@ -283,13 +308,23 @@ def mirror_selected(run_id: str, place_id: str, selected, *, fetch=None, put=Non
             return "written" if _put_blob(name, body, "image/jpeg", meta,
                                           skip_existing=True) else "exists"
     resize = resize or resize_master
+    sv_fetch = sv_fetch or _sv_get
 
     def one(args) -> dict:
         i, item = args
         out = {"ordinal": i, "blob_name": None, "sha1": None, "width": None,
                "height": None, "bytes": None, "status": "failed"}
         try:
-            src = fetch(_source_url(item))
+            url = _source_url(item)
+            src = fetch(url)
+            if not src and item.source == "street_view":
+                for u in _sv_urls(url):
+                    try:
+                        src = sv_fetch(u)
+                    except Exception:
+                        src = None
+                    if src:
+                        break
             if not src:
                 return out
             sha1 = hashlib.sha1(src).hexdigest()[:20]

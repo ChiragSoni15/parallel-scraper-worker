@@ -155,6 +155,8 @@ jobs:
           WORKER_API_BASE: ${{ vars.WORKER_API_BASE }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
           PHASE2_CAPTURE_SCREENSHOTS: "${{ inputs.screenshots || '1' }}"
+          # Worker INFO (TIMING, phase2.*) to stderr; without it the runner log had none (p10).
+          PHASE2_LOG_LEVEL: INFO
           # ASYNC screenshots, preferred path: PUT each PNG straight to an Azure Blob
           # staging container (write-only container SAS — no account key, no read/list).
           # The private drainer (cloud/drain_screenshots_blob.py) empties it to Drive

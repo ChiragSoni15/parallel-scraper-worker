@@ -307,6 +307,10 @@ def scrape_one(
     return captured[0]
 
 
+# Below this many seconds of walk budget left, a degraded page is not retried.
+DEGRADED_RETRY_MIN_S = 10
+
+
 class PlaywrightSession:
     """Long-lived Playwright browser + page held by a Phase-2 consumer thread.
 
@@ -551,7 +555,15 @@ class PlaywrightSession:
         is added. Walk limits per chip walk (design §5): PHASE2_WALK_PHOTO_CAP
         (photos, default 40, 0 = no cap), PHASE2_WALK_MAX_ITEMS (120), PHASE2_WALK_MAX_S
         (90). PHASE2_HORECA_PHOTO_CAP (menu, default 12). photo_dates also carries
-        `items` and `walk_meta`. Returns None only when the page is dead; never raises."""
+        `items` and `walk_meta`. Returns None only when the page is dead; never raises.
+
+        Degraded session render (~half of fresh sessions: tabs Overview+Reviews only, a
+        fixed 10-tile gallery, no chips): the panel tabs are checked first, and a
+        degraded panel or a degraded_gallery walk is re-walked ONCE on a relaunched
+        browser within the same PHASE2_WALK_MAX_S budget; an unrecovered retry keeps
+        the walk with more items. walk_meta gets
+        degraded_retry=1 and degraded_recovered (and degraded_panel=1 when the tabs
+        were degraded); the scrape() panel data is kept either way."""
         import os as _os
         if not self._page_alive():
             return None
@@ -562,13 +574,86 @@ class PlaywrightSession:
         max_items = int(_os.environ.get("PHASE2_WALK_MAX_ITEMS", _hc.WALK_MAX_ITEMS_DEFAULT))
         max_s = int(_os.environ.get("PHASE2_WALK_MAX_S", _hc.WALK_MAX_S_DEFAULT))
 
-        async def _do() -> dict:
+        t_start = time.monotonic()
+
+        async def _do(budget_s: int) -> dict:
             return await _hc.capture_horeca(self._page, photo_cap=menu_cap, with_menu=with_menu,
                                             place_photo_cap=place_cap, walk_max_items=max_items,
-                                            walk_max_s=max_s)
+                                            walk_max_s=budget_s)
+
+        async def _tabs() -> list[str]:
+            try:
+                return [lbl for lbl, _ in await self._page.evaluate(_hc._TABS)]
+            except Exception:
+                return []
+
+        async def _reopen() -> None:
+            await self._page.goto(build_place_url(place_id), wait_until="domcontentloaded",
+                                  timeout=30_000)
+            await _hc._wait_js(self._page, _hc._ENTRY_PRESENT, timeout_ms=10_000)
+            # Settle before the walk: an entry click on a still-loading page walked 0
+            # items live (Glamour), and a full render's tab strip ends in About.
+            try:
+                await self._page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass
+            for _ in range(10):
+                if not _degraded(await _tabs()):
+                    break
+                await self._page.wait_for_timeout(500)
+            await self._page.wait_for_timeout(1_500)
+
+        def _hc_empty() -> dict:
+            return {"items": [], "walk_meta": _hc._new_walk_meta(None)}
+
+        def _degraded(labels: list[str]) -> bool:
+            # Degraded session render: the panel tab strip is Overview + Reviews only.
+            return not any(lbl.startswith(("About", "Photos")) for lbl in labels)
 
         try:
-            hc = self._loop.run_until_complete(_do())
+            labels = self._loop.run_until_complete(_tabs())
+            logger.info("phase2_session.panel_tabs place_id=%s tabs=%s", place_id,
+                        ",".join(labels)[:200])
+            bad_panel = _degraded(labels)
+            # Walk first even on a degraded panel: a re-goto that lands degraded again
+            # walked 0 items live (Glamour), the post-scrape preview walks ~9.
+            hc = self._loop.run_until_complete(_do(max_s))
+            if bad_panel or hc["walk_meta"].get("degraded_gallery"):
+                left = max_s - int(time.monotonic() - t_start)
+                if left >= DEGRADED_RETRY_MIN_S:
+                    # Session-scoped degraded page: a fresh browser gets the full page back
+                    # (same relaunch as panel_extras). Panel data from scrape() is kept.
+                    t_r = time.monotonic()
+                    logger.info("phase2_session.media_degraded place_id=%s panel=%d — relaunching",
+                                place_id, bad_panel)
+                    try:
+                        self._close_browser()
+                        self._open_browser()
+                        self._loop.run_until_complete(_reopen())
+                        labels2 = self._loop.run_until_complete(_tabs())
+                        logger.info("phase2_session.panel_tabs place_id=%s retry=1 tabs=%s", place_id,
+                                    ",".join(labels2)[:200])
+                        left = max(1, max_s - int(time.monotonic() - t_start))
+                        # Still degraded: its walk never beats the first one (live: 0-9 items).
+                        hc2 = (_hc_empty() if _degraded(labels2)
+                               else self._loop.run_until_complete(_do(left)))
+                        wm2 = hc2["walk_meta"]
+                        recovered = (not _degraded(labels2) and not wm2.get("degraded_gallery")
+                                     and bool(hc2.get("items")))
+                        if recovered or len(hc2.get("items") or []) > len(hc.get("items") or []):
+                            hc = hc2
+                        hc["walk_meta"]["degraded_retry"] = 1
+                        hc["walk_meta"]["degraded_recovered"] = int(recovered)
+                        hc["walk_meta"]["timings"]["degraded_retry"] = int((time.monotonic() - t_r) * 1000)
+                        logger.info("phase2_session.media_degraded place_id=%s recovered=%d ms=%d",
+                                    place_id, recovered, hc["walk_meta"]["timings"]["degraded_retry"])
+                    except Exception:
+                        logger.warning("phase2_session.degraded_retry_failed place_id=%s",
+                                       place_id, exc_info=True)
+                        hc["walk_meta"]["degraded_retry"] = 1
+                        hc["walk_meta"]["degraded_recovered"] = 0
+            if bad_panel:
+                hc["walk_meta"]["degraded_panel"] = 1
         except Exception:
             logger.warning("phase2_session.media_capture_failed place_id=%s",
                            place_id, exc_info=True)

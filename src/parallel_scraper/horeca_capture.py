@@ -40,6 +40,9 @@ PLACE_PHOTO_CAP_DEFAULT = WALK_PHOTO_CAP_DEFAULT   # old name, kept for importer
 ITEM_TIMEOUT_MS = 8_000       # today's Next ceiling (26 x 300 ms)
 CHIP_TIMEOUT_MS = 2_000       # today's chip sleep, now a ceiling
 LAZY_TIMEOUT_MS = 4_000       # today's lazy-load ceiling (8 x 500 ms)
+LAZY_TRIES = 3                # scroll + wait attempts inside LAZY_TIMEOUT_MS
+CHIP_FIRST_MS = 1_500         # chip's first item by key change, before the tile-0 click
+MENU_CHIP_CAP = 21            # Menu-chip photos walked only to tag them (never mirrored)
 
 # ONE read of the current viewer item (§9.1 item rule). Also installs, once per
 # page, a MutationObserver that counts title-card re-renders (tc_gen).
@@ -105,11 +108,19 @@ _SNAP = r"""() => {
 # a = the snapshot taken just before the click (viewer_url_key, img_src, tc_gen).
 _ITEM_READY = "(a) => { const s = (" + _SNAP + r""")();
     // First item of a new chip can be the photo already shown (owner #1 == All #1,
-    // seen live): accept it only when its image is the new grid's first thumb.
-    if (a.grid0 && s.img_src && s.img_src.split('=')[0] === a.grid0 && s.img_complete
-        && s.natural_width > 0 && s.caption && s.tc_gen > a.tc_gen
-        && s.slide_key === s.viewer_url_key) return s;
+    // seen live): the key never changes and the title card need not re-render. Only
+    // after the new grid's first tile was clicked (a.same_ok) is an unchanged key that
+    // item. Grid thumb URLs are no proof: one photo comes under different URL paths.
+    if (a.same_ok && s.viewer_url_key === a.viewer_url_key) {
+        if (s.caption && s.slide_key === s.viewer_url_key
+            && (/^video/i.test(s.caption) || (s.img_complete && s.natural_width > 0))) return s;
+        return (!s.caption && s.attr && s.img_complete) ? s : false;
+    }
     if (s.viewer_url_key === a.viewer_url_key) return false;
+    // A key an earlier chip walk already recorded: the caller drops it (owner/menu wins),
+    // and its title card often does not re-render on a revisit (live: a Menu item met
+    // again in All timed out with key, image and caption all ready).
+    if (a.known && a.known.includes(s.viewer_url_key)) return s;
     const capOk = s.caption && s.tc_gen > a.tc_gen && s.slide_key === s.viewer_url_key;
     if (s.caption && /^video/i.test(s.caption)) return capOk ? s : false;   // §6: no video wait
     if (!s.img_src || s.img_src === a.img_src || !s.img_complete || !(s.natural_width > 0)) return false;
@@ -166,16 +177,24 @@ _VIEWER_CLOSED ="""() => !document.querySelector('button[aria-label*="Next" i]')
 _ENTRY_PRESENT = """() => !!document.querySelector('button[jsaction*="heroHeaderImage"]')
     || [...document.querySelectorAll('button')].some(b => (b.textContent || '').includes('See photos'))"""
 
-# Bring the LAST loaded thumbnail into view: the grid lazy-loads on intersection, so
-# setting scrollTop on containers did nothing, while scrollIntoView loaded the next
-# batch (20 -> 22) with the viewer still open. Escape is not an option — it tears the
-# whole gallery down (0 thumbnails left).
+# Bring the LAST loaded thumbnail into view and push its scroll container to the
+# bottom: the grid lazy-loads on intersection (20 -> 22 seen with the viewer open).
+# Escape is not an option — it tears the whole gallery down (0 thumbnails left).
 _SCROLL_GRID = """() => {
     const t = [...document.querySelectorAll('[data-photo-index]')];
     if (!t.length) return 0;
-    t[t.length - 1].scrollIntoView({block: 'end'});
+    const last = t[t.length - 1];
+    last.scrollIntoView({block: 'end'});
+    for (let p = last.parentElement; p; p = p.parentElement)
+        if (p.scrollHeight > p.clientHeight + 1 && /(auto|scroll)/.test(getComputedStyle(p).overflowY)) {
+            p.scrollTop = p.scrollHeight; break; }
     return t.length;
 }"""
+
+_GRID_COUNT = "() => document.querySelectorAll('[data-photo-index]').length"
+
+_CLICK_TILE0 = """() => { const t = document.querySelector('[data-photo-index="0"]');
+    if (t) t.click(); return !!t; }"""
 
 _GROWN = """(n) => {
     if (document.querySelectorAll('[data-photo-index]').length > n) return true;
@@ -230,14 +249,21 @@ async def _click_next(page, timeout_ms: int = 3_000) -> None:
 
 
 async def _load_more(page, timeout_ms: int = LAZY_TIMEOUT_MS) -> bool:
-    """The 'See photos' grid lazy-loads ~10 thumbnails at a time and the viewer can
-    only page through loaded ones, so Next turns off at item 10 until the grid is
-    scrolled (fleet: 546 listings stopped at exactly 10 of 22-40). Scroll it and wait
-    for more thumbs or Next back on; False = the real end of the gallery."""
-    n = await page.evaluate(_SCROLL_GRID)
-    if not n:
-        return False
-    return await _wait_js(page, _GROWN, n, min(LAZY_TIMEOUT_MS, timeout_ms))
+    """The grid lazy-loads thumbnails in batches and the viewer can only page through
+    loaded ones, so Next turns off at the last loaded tile until the grid is scrolled.
+    Scroll it and wait for more tiles or Next back on, LAZY_TRIES times inside one
+    ceiling; False = no growth (the end, or a stall the caller judges with _stalled).
+    Live (Oct 2026): the DEGRADED session render (no Menu/About panel tabs, no chips)
+    is a fixed 10-tile preview that never grows, whatever is scrolled, and goto or
+    reload keep it; only a fresh browser session gets the full gallery back."""
+    budget = min(LAZY_TIMEOUT_MS, timeout_ms)
+    for _ in range(LAZY_TRIES):
+        n = await page.evaluate(_SCROLL_GRID)
+        if not n:
+            return False
+        if await _wait_js(page, _GROWN, n, max(1, budget // LAZY_TRIES)):
+            return True
+    return False
 
 
 def _classify(s: dict) -> dict:
@@ -261,7 +287,7 @@ _UNKNOWN = {"kind": "unknown", "url": None, "caption": None, "viewer_key": None,
 
 
 async def _walk_viewer(page, cur: dict | None, *, photo_cap: int, max_items: int,
-                       deadline: float) -> tuple[list[dict], dict]:
+                       deadline: float, known=()) -> tuple[list[dict], dict]:
     """Walk the open viewer from `cur` (the ready snapshot of the shown item, None =
     it timed out). Returns items and {limits_hit, unknown, photos}. Ends on: the real
     end of the gallery, a wrap to a seen key, or a limit (§5)."""
@@ -269,6 +295,7 @@ async def _walk_viewer(page, cur: dict | None, *, photo_cap: int, max_items: int
     seen: set[str] = set()
     hit: list[str] = []
     photos = unknown = 0
+    end_tiles = None     # grid tile count when the walk ended on Next off + no growth
     while True:
         if cur is None:
             items.append(dict(_UNKNOWN))
@@ -286,6 +313,8 @@ async def _walk_viewer(page, cur: dict | None, *, photo_cap: int, max_items: int
                 not await _load_more(page, _ms_left(deadline, LAZY_TIMEOUT_MS)):
             if time.monotonic() >= deadline:
                 hit.append("max_s")      # the lazy load ran out of walk time
+            else:
+                end_tiles = await page.evaluate(_GRID_COUNT)
             break
         if photo_cap and photos >= photo_cap:
             hit.append("photo_cap")
@@ -296,7 +325,7 @@ async def _walk_viewer(page, cur: dict | None, *, photo_cap: int, max_items: int
         if time.monotonic() >= deadline:
             hit.append("max_s")
             break
-        prev = await _snap(page)
+        prev = {**await _snap(page), "known": list(known)}
         await _click_next(page, _ms_left(deadline, 3_000))
         cur = await _wait_item(page, prev, _ms_left(deadline, ITEM_TIMEOUT_MS))
         if cur is None and time.monotonic() >= deadline:
@@ -304,16 +333,32 @@ async def _walk_viewer(page, cur: dict | None, *, photo_cap: int, max_items: int
             unknown += 1
             hit.append("max_s")
             break
-    return items, {"limits_hit": hit, "unknown": unknown, "photos": photos}
+    return items, {"limits_hit": hit, "unknown": unknown, "photos": photos,
+                   "end_tiles": end_tiles}
+
+
+def _stalled(n_items: int, end_tiles: int | None, chips: bool) -> bool:
+    """lazy_load_stall: the walk stopped before the grid's tile count, or (no chips)
+    on a full 10-tile preview, which is the degraded render (see _load_more)."""
+    if end_tiles is None:
+        return False
+    # ponytail: a real 10+ item gallery shown without chips is flagged too and the
+    # repair pass re-walks it; use the page's photo total once the page shows one.
+    return n_items < end_tiles or (not chips and end_tiles >= 10)
+
+
+_PANEL_TAB = re.compile(r"^(Overview|Reviews|About)\b")
 
 
 async def _list_gallery_chips(page, before: set[str] = frozenset()) -> list[str]:
-    """Visible tab labels that appeared with the gallery (panel tabs excluded)."""
-    return [lbl for lbl, _ in await page.evaluate(_TABS) if lbl and lbl not in before]
+    """Visible gallery chip labels. Panel tabs are hidden while the gallery is open;
+    excluding by the label set seen `before` also dropped the gallery's "Menu" chip
+    (the panel has a "Menu" tab too; p10: 0 Menu chips seen), so exclude by pattern."""
+    return [lbl for lbl, _ in await page.evaluate(_TABS) if lbl and not _PANEL_TAB.match(lbl)]
 
 
 async def _walk_tab(page, label: str | None, photo_cap: int, max_items: int, max_s: int,
-                    first_click: bool = False, entry: dict | None = None
+                    first_click: bool = False, entry: dict | None = None, known=()
                     ) -> tuple[list[dict], dict] | None:
     """Select chip `label` (None = walk the stream already shown), wait for chip
     readiness (§9.1), walk it. None = the chip click failed or chip readiness timed
@@ -322,7 +367,7 @@ async def _walk_tab(page, label: str | None, photo_cap: int, max_items: int, max
     clicked, so a failed entry wait gives an unknown first item, never stale content."""
     t0 = time.monotonic()
     deadline = t0 + max_s
-    prev = await _snap(page)
+    prev = {**await _snap(page), "known": list(known)}
     need_change = False
     if label is not None:
         g0 = await page.evaluate(_GRID)
@@ -344,10 +389,17 @@ async def _walk_tab(page, label: str | None, photo_cap: int, max_items: int, max
         if not grid["count"]:       # ok-empty: the chip really has no items
             return [], {"limits_hit": [], "unknown": 0, "photos": 0,
                         "ms": int((time.monotonic() - t0) * 1000)}
-        prev = {**prev, "grid0": grid["keys"][0]}
-    cur = await _wait_item(page, prev, _ms_left(deadline, ITEM_TIMEOUT_MS)) if need_change else entry
+    cur = entry
+    if need_change:
+        # The viewer jumps to the chip's first item (~0.4 s live). If its key did not
+        # change, the first item may be the photo already shown: open the new grid's
+        # first tile, then an unchanged key IS that item (§9.1 finding 4).
+        cur = await _wait_item(page, prev, _ms_left(deadline, CHIP_FIRST_MS))
+        if cur is None and await page.evaluate(_CLICK_TILE0):
+            cur = await _wait_item(page, {**prev, "same_ok": True},
+                                   _ms_left(deadline, ITEM_TIMEOUT_MS))
     items, meta = await _walk_viewer(page, cur, photo_cap=photo_cap, max_items=max_items,
-                                     deadline=deadline)
+                                     deadline=deadline, known=known)
     meta["ms"] = int((time.monotonic() - t0) * 1000)
     return items, meta
 
@@ -356,7 +408,8 @@ def _new_walk_meta(entry: str | None) -> dict:
     return {"walk_ok": False, "reason": None, "owner_count": 0, "owner_count_known": False,
             "truncated": 0, "limits_hit": [], "truncated_reasons": [], "chip_unavailable": 0,
             "latest_ordered": None, "video_count": 0, "pano_count": 0, "unknown_count": 0,
-            "chips_seen": [], "timings": {}, "entry": entry}
+            "chips_seen": [], "timings": {}, "entry": entry, "menu_count": 0,
+            "degraded_gallery": 0}
 
 
 async def _walk_gallery(page, chips: list[str], wm: dict, photo_cap: int, max_items: int,
@@ -368,6 +421,7 @@ async def _walk_gallery(page, chips: list[str], wm: dict, photo_cap: int, max_it
         return next((c for c in chips if re.match(rx, c, re.I)), None)
 
     owner, latest, allc = pick(r"^By owner"), pick(r"^Latest"), pick(r"^All$")
+    menu = pick(r"^Menu$")
     items: list[dict] = []
     keys: set[str] = set()
 
@@ -378,6 +432,11 @@ async def _walk_gallery(page, chips: list[str], wm: dict, photo_cap: int, max_it
                 wm["limits_hit"].append(h)
         if meta["unknown"] and "item_timeout" not in wm["truncated_reasons"]:
             wm["truncated_reasons"].append("item_timeout")
+        if _stalled(len(walked), meta.get("end_tiles"), bool(chips)):
+            if "lazy_load_stall" not in wm["truncated_reasons"]:
+                wm["truncated_reasons"].append("lazy_load_stall")
+            if not chips:
+                wm["degraded_gallery"] = 1
         for it in walked:
             k = it["viewer_key"]
             if k and k in keys:
@@ -401,10 +460,19 @@ async def _walk_gallery(page, chips: list[str], wm: dict, photo_cap: int, max_it
         # Chips listed without "By owner": no owner photos. No chips at all (the
         # gallery sometimes renders without them, seen live): owner count unknown.
         wm["owner_count_known"] = bool(chips)
+    if menu:
+        # Menu chip: walked before the gallery so its photos keep chip="Menu" (a key
+        # is added once) and gallery_select skips them. Not a gallery walk.
+        res = await _walk_tab(page, menu, MENU_CHIP_CAP, max_items, max_s,
+                              first_click=not clicked, entry=entry, known=keys)
+        clicked = True
+        if res is not None:
+            add(res[0], "menu", menu, res[1])
+            wm["menu_count"] = res[1]["photos"]
     ran = False
     for chip in (c for c in (latest, allc) if c):
         res = await _walk_tab(page, chip, photo_cap, max_items, max_s, first_click=not clicked,
-                              entry=entry)
+                              entry=entry, known=keys)
         clicked = True
         if res is None:
             wm["chip_unavailable"] = 1        # skipped Latest falls back to All

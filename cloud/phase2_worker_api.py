@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from parallel_scraper.logging_setup import phase_var, run_id_var, setup_logging
+from parallel_scraper.normalise import null_if_sentinel
 
 from cloud import delisted
 from cloud.http_state import HttpState
@@ -434,6 +435,16 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
     return result
 
 
+def _na_to_none(row: dict) -> dict:
+    """§8.1: top-level 'N/A' / '' strings -> None before serialization; the nulled
+    keys go in row['raw_sentinels'] for audit."""
+    nulled = [k for k, v in row.items() if isinstance(v, str) and null_if_sentinel(v) is None]
+    for k in nulled:
+        row[k] = None
+    row["raw_sentinels"] = nulled
+    return row
+
+
 def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state, state=None):
     """Scrape a single pid on `session` (design §1 order: panel, gallery walks,
     select + mirror, then serialize). Return (done, failed, extras); all three None
@@ -457,7 +468,7 @@ def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state, state
         media, tm = (_photos_one(run_id, pid, row, urls) if hasattr(session, "media_capture")
                      else ([], {"thumbs": 0, "mirror": 0}))
         done = {"place_id": pid, "attempts": attempts,
-                "data": json.dumps(row, default=str), "image_urls": urls, "media": media}
+                "data": json.dumps(_na_to_none(row), default=str), "image_urls": urls, "media": media}
         if os.environ.get("PHASE2_LEGACY_PANEL_PHOTOS", "0") == "1":
             _sink_photos(run_id, pid, urls)
         if capture_shots:
@@ -472,9 +483,10 @@ def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state, state
         extras = _panel_extras_one(session, run_id, pid)
         # ponytail: reviews=-1 = not measured; Reviews->Newest runs inside session.scrape
         # (vendored extractor) and is counted in panel. Split it there if p10 needs it.
-        logger.info("TIMING pid=%s panel=%d reviews=-1 walk=%d thumbs=%d mirror=%d total=%d",
-                    pid, _ms(t0, t_panel), _ms(t_panel, t_walk), tm["thumbs"], tm["mirror"],
-                    _ms(t0, time.monotonic()))
+        timing = (f"TIMING pid={pid} panel={_ms(t0, t_panel)} reviews=-1 walk={_ms(t_panel, t_walk)} "
+                  f"thumbs={tm['thumbs']} mirror={tm['mirror']} total={_ms(t0, time.monotonic())}")
+        print(timing, flush=True)   # p10: unconditional, whatever the log handlers do
+        logger.info(timing)
         return done, None, extras
     except Exception as exc:
         logger.warning("phase2.place_failed run_id=%s pid=%s url=%s", run_id, pid,
@@ -750,7 +762,10 @@ def main(argv=None, state=None) -> int:
                     help="exit 3 when accepted failed/(done+failed) exceeds this %% "
                          "(env PHASE2_SHARD_MAX_FAIL as a fraction, default 0.10)")
     args = ap.parse_args(argv)
-    setup_logging(None, level="INFO")
+    # p10: the stderr handler defaulted to WARNING, so no INFO line reached the runner log
+    level = (os.environ.get("PHASE2_LOG_LEVEL") or "INFO").upper()
+    os.environ.setdefault("PARALLEL_SCRAPER_STDERR_LEVEL", level)
+    setup_logging(None, level=level)
     gate = _GateState(state if state is not None else HttpState())
     run_worker(args.run_id, args.shard, max_minutes=args.max_minutes,
                batch=args.batch, max_places=args.max_places,
