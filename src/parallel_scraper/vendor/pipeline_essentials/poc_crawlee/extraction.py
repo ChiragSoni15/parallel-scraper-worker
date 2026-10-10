@@ -10,12 +10,36 @@ Strategy: Hybrid JS injection + Playwright interactions.
 import os
 import re
 import logging
+import time
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Optional
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
 
 from parallel_scraper import normalise as nz
 from .models import PlaceData
+
+
+class Timer(dict):
+    """Phase -> ms. `with t.phase("x"):` adds the block's wall time to t["x"]."""
+
+    @contextmanager
+    def phase(self, name: str):
+        t0 = time.monotonic()
+        try:
+            yield
+        finally:
+            self[name] = self.get(name, 0) + int((time.monotonic() - t0) * 1000)
+
+
+# The phase2 session's per-place Timer (set by PlaywrightSession.scrape); None elsewhere.
+PLACE_TIMER: ContextVar[Optional[Timer]] = ContextVar("place_timer", default=None)
+
+
+def _phase(name: str):
+    t = PLACE_TIMER.get()
+    return t.phase(name) if t is not None else nullcontext()
 
 logger = logging.getLogger(__name__)
 
@@ -1249,15 +1273,16 @@ _PANEL_TABS_JS = r"""() => [...document.querySelectorAll('[role=tab]')]
 async def _panel_degraded(page: Page) -> bool:
     """Degraded session render: a tab strip with no About/Photos tab (Overview + Reviews only). No tabs at all is
     not degraded (slow page or no-tab layout: the old path runs)."""
-    try:
-        await page.wait_for_selector('[role="tab"]', state="visible", timeout=3000)
-    except Exception:
-        pass
-    try:
-        labels = await page.evaluate(_PANEL_TABS_JS)
-    except Exception:
-        return False
-    return bool(labels) and not any(lbl.startswith(("About", "Photos")) for lbl in labels)
+    with _phase("panel_ready"):
+        try:
+            await page.wait_for_selector('[role="tab"]', state="visible", timeout=3000)
+        except Exception:
+            pass
+        try:
+            labels = await page.evaluate(_PANEL_TABS_JS)
+        except Exception:
+            return False
+        return bool(labels) and not any(lbl.startswith(("About", "Photos")) for lbl in labels)
 
 
 async def _apply_normalised(page: Page, place: PlaceData, observed: datetime, review_info: dict) -> None:
@@ -1296,8 +1321,15 @@ async def extract_all(page: Page, url: str, config=None, place_id: Optional[str]
     """Extract all attributes (`_extract_all_raw`), then add observed_at and the normalised keys (§8.5, §8.7)."""
     observed = datetime.now(timezone.utc)   # extract_all runs right after the page load
     review_info: dict = {}
+    t, t0 = PLACE_TIMER.get(), time.monotonic()
+    if t is not None:   # extract = this call minus the reviews chain and the tab-strip wait
+        t.extract_start = t0
+        inner = t.get("reviews", 0) + t.get("panel_ready", 0)
     place = await _extract_all_raw(page, url, config, place_id, lean, lean_enrich, photo_urls, review_info)
     await _apply_normalised(page, place, observed, review_info)
+    if t is not None:
+        inner = t.get("reviews", 0) + t.get("panel_ready", 0) - inner
+        t["extract"] = t.get("extract", 0) + max(0, int((time.monotonic() - t0) * 1000) - inner)
     return place
 
 
@@ -1497,7 +1529,8 @@ async def _extract_all_raw(page: Page, url: str, config=None, place_id: Optional
             review_info["verified"] = False
     elif rc > 0 and not closed_status:
         try:
-            newest_date = await extract_latest_review_date(page, review_info, rc)
+            with _phase("reviews"):
+                newest_date = await extract_latest_review_date(page, review_info, rc)
             if newest_date and newest_date != "N/A":
                 place.latest_review_date = newest_date
         except Exception:

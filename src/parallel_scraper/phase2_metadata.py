@@ -515,17 +515,28 @@ class PlaywrightSession:
 
     def scrape(self, place_id: str) -> Optional[dict]:
         """Scrape one placeId against the held browser/page. Returns the row
-        dict (or a FAILED dict on a per-place error)."""
+        dict (or a FAILED dict on a per-place error). row["timing"] = Timer of
+        goto / panel_ready / extract / reviews ms (see extraction.Timer)."""
+        from parallel_scraper.vendor.pipeline_essentials.poc_crawlee.extraction import (
+            PLACE_TIMER, Timer)
         if not self._page_alive():
             logger.info("phase2_session.reopen reason=page_closed")
             self.recycle()
         url = build_place_url(place_id)
         captured: list[dict] = []
+        timer, dcl = Timer(), []
+        # goto vs panel_ready split: the goto lives in the vendored _process_one_place,
+        # so stamp the page's DOMContentLoaded (last one before extract wins: nav retries).
+        stamp = lambda *_: dcl.append(time.monotonic())  # noqa: E731
+        page = self._page
+        page.on("domcontentloaded", stamp)
+        t0 = time.monotonic()
 
         def on_row(row: dict) -> None:
             captured.append(row)
 
         async def _do() -> None:
+            PLACE_TIMER.set(timer)   # the Task's own context copy: no reset needed
             await _process_one_place(
                 page=self._page,
                 row={"url": url, "place_id": place_id, "label": ""},
@@ -551,8 +562,21 @@ class PlaywrightSession:
                         logger.debug("phase2_session.capture_panels_failed place_id=%s",
                                      place_id, exc_info=True)
 
-        self._loop.run_until_complete(_do())
+        try:
+            self._loop.run_until_complete(_do())
+        finally:
+            try:
+                page.remove_listener("domcontentloaded", stamp)
+            except Exception:
+                pass
         self.places_scraped += 1
+        start = getattr(timer, "extract_start", None)
+        if start is not None:
+            mid = max([s for s in dcl if s <= start] or [start])
+            timer["goto"] = int((mid - t0) * 1000)
+            timer["panel_ready"] = timer.get("panel_ready", 0) + int((start - mid) * 1000)
+        if captured:
+            captured[0]["timing"] = timer
         return captured[0] if captured else None
 
     def panel_extras(self, place_id: str) -> Optional[dict]:

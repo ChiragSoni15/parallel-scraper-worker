@@ -139,6 +139,36 @@ def _ms(a: float, b: float) -> int:
     return int((b - a) * 1000)
 
 
+# Per-place phase ms, in the TIMING line and place_data $.timing; 0 = phase did not run.
+# goto/panel_ready/extract/reviews come from session.scrape (row["timing"]); walk_* and
+# degraded_retry from walk_meta.timings. submit_wait: 0, not measured ($.timing is
+# serialized before the POST it would time).
+TIMING_KEYS = ("goto", "panel_ready", "extract", "reviews", "degraded_retry", "walk_owner",
+               "walk_latest", "walk_all", "thumbs", "mirror", "submit_wait", "total")
+
+
+def _place_timing(scrape_tm: dict | None, walk_tm: dict | None, tm: dict, total: int) -> dict:
+    t = dict.fromkeys(TIMING_KEYS, 0)
+    t.update({k: int(v) for k, v in (scrape_tm or {}).items() if k in t})
+    for chip, ms in (walk_tm or {}).items():
+        c = chip.lower()
+        k = ("degraded_retry" if c == "degraded_retry" else "walk_owner" if c.startswith("by owner")
+             else "walk_latest" if c.startswith("latest") else "walk_all")   # All, Menu, current
+        t[k] += int(ms)
+    t.update(thumbs=int(tm["thumbs"]), mirror=int(tm["mirror"]), total=total)
+    return t
+
+
+def _timing_line(pid, t: dict) -> str:
+    """Legacy keys first, contiguous and in their old order (p200 a1.py regex), then the rest."""
+    legacy = {"panel": t["goto"] + t["panel_ready"] + t["extract"] + t["reviews"],
+              "reviews": t["reviews"],
+              "walk": t["walk_owner"] + t["walk_latest"] + t["walk_all"],
+              "thumbs": t["thumbs"], "mirror": t["mirror"], "total": t["total"]}
+    rest = {k: t[k] for k in TIMING_KEYS if k not in legacy}
+    return f"TIMING pid={pid} " + " ".join(f"{k}={v}" for k, v in {**legacy, **rest}.items())
+
+
 def _full_url(it: dict) -> str | None:
     """Google CDN URL of a walked item: the viewer's own image URL (`!6s`, see
     horeca_capture), else the lh3 path of an AF1Qip photo id from the viewer key
@@ -492,14 +522,12 @@ def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state, state
         if not row or (row.get("name") or "") in ("", "FAILED"):
             _delisted_or_raise(session, state, run_id, pid, attempts)
             return None, None, None
-        t_panel = time.monotonic()
         _media_one(session, run_id, pid, row)
-        t_walk = time.monotonic()
+        # read before _photos_one: a failed walk keeps only the summary in photo_dates
+        walk_tm = ((row.get("photo_dates") or {}).get("walk_meta") or {}).get("timings")
         urls = _split_image_urls(row.get("image_urls"))
         media, tm = (_photos_one(run_id, pid, row, urls) if hasattr(session, "media_capture")
                      else ([], {"thumbs": 0, "mirror": 0}))
-        done = {"place_id": pid, "attempts": attempts,
-                "data": json.dumps(_na_to_none(row), default=str), "image_urls": urls, "media": media}
         if os.environ.get("PHASE2_LEGACY_PANEL_PHOTOS", "0") == "1":
             _sink_photos(run_id, pid, urls)
         if capture_shots:
@@ -512,10 +540,10 @@ def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state, state
                                run_id, pid, exc_info=True)
         # Last, because it re-navigates the page away from the scraped panel.
         extras = _panel_extras_one(session, run_id, pid)
-        # ponytail: reviews=-1 = not measured; Reviews->Newest runs inside session.scrape
-        # (vendored extractor) and is counted in panel. Split it there if p10 needs it.
-        timing = (f"TIMING pid={pid} panel={_ms(t0, t_panel)} reviews=-1 walk={_ms(t_panel, t_walk)} "
-                  f"thumbs={tm['thumbs']} mirror={tm['mirror']} total={_ms(t0, time.monotonic())}")
+        row["timing"] = _place_timing(row.get("timing"), walk_tm, tm, _ms(t0, time.monotonic()))
+        done = {"place_id": pid, "attempts": attempts,
+                "data": json.dumps(_na_to_none(row), default=str), "image_urls": urls, "media": media}
+        timing = _timing_line(pid, row["timing"])
         print(timing, flush=True)   # p10: unconditional, whatever the log handlers do
         logger.info(timing)
         return done, None, extras
