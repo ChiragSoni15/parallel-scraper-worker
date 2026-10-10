@@ -152,14 +152,6 @@ jobs:
         run: python -m playwright install-deps chromium
       - name: Playwright marker
         run: echo "STARTUP t_playwright=$(date +%s)"
-      - name: Resource sampler (cores, memory every 30 s)
-        run: |
-          echo "RESOURCES cores=$(nproc) mem_total_mb=$(free -m | awk '/Mem:/{print $2}')"
-          ( while true; do
-              echo "RESOURCES t=$(date +%s) mem_used_mb=$(free -m | awk '/Mem:/{print $3}') mem_avail_mb=$(free -m | awk '/Mem:/{print $7}') load1=$(cut -d' ' -f1 /proc/loadavg) chromium_rss_mb=$(ps -eo rss,comm | awk '/chrom/{s+=$1} END{printf "%d", s/1024}') chromium_procs=$(ps -eo comm | grep -c chrom)"
-              sleep 30
-            done ) &
-          echo $! > /tmp/sampler.pid
       - name: Scrape (API mode)
         env:
           WORKER_API_BASE: ${{ vars.WORKER_API_BASE }}
@@ -201,12 +193,15 @@ jobs:
           [ -n "$IN_WALK_MAX_ITEMS" ] && export PHASE2_WALK_MAX_ITEMS="$IN_WALK_MAX_ITEMS"
           [ -n "$IN_WALK_MAX_S" ] && export PHASE2_WALK_MAX_S="$IN_WALK_MAX_S"
           [ -n "$IN_SHARD_MAX_FAIL" ] && export PHASE2_SHARD_MAX_FAIL="$IN_SHARD_MAX_FAIL"
+          echo "RESOURCES cores=$(nproc) mem_total_mb=$(free -m | awk '/Mem:/{print $2}')"
+          ( while true; do echo "RESOURCES t=$(date +%s) mem_used_mb=$(free -m | awk '/Mem:/{print $3}') mem_avail_mb=$(free -m | awk '/Mem:/{print $7}') load1=$(cut -d' ' -f1 /proc/loadavg) chromium_rss_mb=$(ps -eo rss,comm | awk '/chrom/{s+=$1} END{printf "%d", s/1024}') chromium_procs=$(ps -eo comm | grep -c chrom)"; sleep 30; done ) & SAMPLER=$!
           python -m cloud.phase2_worker_api \
             --run-id "${{ inputs.run_id || vars.ACTIVE_RUN_ID }}" \
             --shard "${{ matrix.shard }}" \
             --max-minutes "${{ inputs.max_minutes || '300' }}" \
             --concurrency "${{ inputs.concurrency || vars.ACTIVE_CONCURRENCY || '3' }}" \
             --batch "${{ inputs.batch || '20' }}"
+          RC=$?; kill $SAMPLER 2>/dev/null; exit $RC
 
       # The durable screenshot queue: each shard's captured PNGs + manifest.jsonl, uploaded
       # off the ephemeral runner. Drained to Drive later by cloud/drain_screenshots.py.

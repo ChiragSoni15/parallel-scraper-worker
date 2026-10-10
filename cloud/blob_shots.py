@@ -249,9 +249,10 @@ _MASTER_QUALITY = 85
 
 
 def resize_master(src: bytes) -> tuple[bytes, int, int]:
-    """Longest side 1600 px, JPEG q85. Returns (jpeg_bytes, width, height)."""
-    from PIL import Image  # lazy: the worker imports this module without Pillow
-    img = Image.open(io.BytesIO(src)).convert("RGB")
+    """Longest side 1600 px, JPEG q85, EXIF orientation applied (the re-encode drops
+    EXIF, so an unrotated phone photo showed 90 degrees off). Returns (jpeg_bytes, width, height)."""
+    from PIL import Image, ImageOps  # lazy: the worker imports this module without Pillow
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(src))).convert("RGB")
     img.thumbnail((_MASTER_SIDE, _MASTER_SIDE))
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=_MASTER_QUALITY)

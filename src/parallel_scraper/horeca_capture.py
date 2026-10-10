@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 
@@ -37,7 +38,17 @@ WALK_MAX_S_DEFAULT = 90
 OWNER_PHOTO_CAP = 21          # the 21st photo tells "20 or fewer" from "more" (§5)
 PLACE_PHOTO_CAP_DEFAULT = WALK_PHOTO_CAP_DEFAULT   # old name, kept for importers
 
-ITEM_TIMEOUT_MS = 8_000       # today's Next ceiling (26 x 300 ms)
+# Next -> item ready, 267 items on 12 slow p200 outlets (Oct 2026): p50 0.29 s, p95 1.0 s,
+# p99 1.2 s, max 3.9 s; so a 2 s fast wait, then the same wait extended up to the old
+# 8 s ceiling WITHOUT re-clicking (a delayed first click plus a second one skips a
+# photo) before an item is unknown; ITEM_STUCK unknowns in a row end that chip walk
+# (p200: an unmatched item kind cost 8 s each until max_s). ITEM_RETRY=1 re-clicks Next
+# when the key did not move (experiment only).
+ITEM_TIMEOUT_MS = int(os.environ.get("PHASE2_ITEM_TIMEOUT_MS") or 2_000)
+ITEM_MAX_MS = 8_000           # an item's whole wait from the Next click
+TILE0_TIMEOUT_MS = 8_000      # a chip's first tile opened by click (not re-measured)
+ITEM_RETRY = int(os.environ.get("PHASE2_ITEM_RETRY") or 0)
+ITEM_STUCK = int(os.environ.get("PHASE2_ITEM_STUCK") or 3)
 CHIP_TIMEOUT_MS = 2_000       # today's chip sleep, now a ceiling
 LAZY_TIMEOUT_MS = 4_000       # today's lazy-load ceiling (8 x 500 ms)
 LAZY_TRIES = 3                # scroll + wait attempts inside LAZY_TIMEOUT_MS
@@ -121,11 +132,28 @@ _ITEM_READY = "(a) => { const s = (" + _SNAP + r""")();
     // and its title card often does not re-render on a revisit (live: a Menu item met
     // again in All timed out with key, image and caption all ready).
     if (a.known && a.known.includes(s.viewer_url_key)) return s;
-    const capOk = s.caption && s.tc_gen > a.tc_gen && s.slide_key === s.viewer_url_key;
+    const slideOk = s.caption && s.slide_key === s.viewer_url_key;
+    const capOk = slideOk && s.tc_gen > a.tc_gen;
     if (s.caption && /^video/i.test(s.caption)) return capOk ? s : false;   // §6: no video wait
     if (!s.img_src || s.img_src === a.img_src || !s.img_complete || !(s.natural_width > 0)) return false;
-    if (s.caption) return capOk ? s : false;
-    return s.attr ? s : false;      // Street View: only the "Image capture" bar
+    // a.same_cap (extended wait only): the item before had the same caption text, so the
+    // title card need not re-render (live: 3 "Photo - Apr 2024" in a row ended a walk).
+    // Accepted only with the new key AND a new, loaded image, from this one snapshot.
+    if (s.caption) return (capOk || (a.same_cap && slideOk && s.caption === a.caption)) ? s : false;
+    if (s.attr) return s;           // Street View: only the "Image capture" bar
+    // Partner photo (lh3 /gps-proxy/): never a caption nor an attribution bar. Live
+    // (Oct 2026): every 8 s item timeout on the 90 s p200 walks was one of these.
+    return /\/gps-proxy\//.test(s.img_src) ? s : false;
+}"""
+
+# Why an item wait timed out: which part of the item rule still fails against `a`.
+_TIMEOUT_DIAG = "(a) => { const s = (" + _SNAP + r""")();
+    const b = document.querySelector('button[aria-label*="Next" i]');
+    return {key_changed: s.viewer_url_key !== a.viewer_url_key, src_changed: s.img_src !== a.img_src,
+            has_src: !!s.img_src, complete: s.img_complete, nw: s.natural_width, cap: s.caption,
+            slide_ok: s.slide_key === s.viewer_url_key, tc_delta: s.tc_gen - a.tc_gen, attr: !!s.attr,
+            next: b ? (b.disabled || b.getAttribute('aria-disabled') === 'true' ? 'off' : 'on') : 'none',
+            src: (s.img_src || '').slice(0, 60)};
 }"""
 
 _GRID = r"""() => {
@@ -276,6 +304,8 @@ def _classify(s: dict) -> dict:
         it.update(kind="video", url=None)
     elif cap and ("360" in cap or sv_img):
         it["kind"] = "360"
+    elif not cap and src and "/gps-proxy/" in src:
+        it["kind"] = "photo"          # partner photo: undated, never Street View
     elif not cap:
         it.update(kind="street_view", caption=s.get("attr"), pano_url=s.get("href"))
     else:
@@ -295,6 +325,9 @@ async def _walk_viewer(page, cur: dict | None, *, photo_cap: int, max_items: int
     seen: set[str] = set()
     hit: list[str] = []
     photos = unknown = 0
+    item_ms: list[int] = []   # per Next: ms to ready, negative = timed out
+    stuck = 0                 # unknowns in a row
+    why = "limit"
     end_tiles = None     # grid tile count when the walk ended on Next off + no growth
     while True:
         if cur is None:
@@ -302,12 +335,14 @@ async def _walk_viewer(page, cur: dict | None, *, photo_cap: int, max_items: int
             unknown += 1
         else:
             if cur["viewer_url_key"] in seen:
+                why = "wrap"
                 break
             seen.add(cur["viewer_url_key"])
             it = _classify(cur)
             items.append(it)
             photos += it["kind"] == "photo"
         if not await page.locator('button[aria-label*="Next" i]').count():
+            why = "no_next"
             break    # a lone Street View panorama: arrow keys move the camera
         if await page.evaluate(_NEXT_DISABLED) and \
                 not await _load_more(page, _ms_left(deadline, LAZY_TIMEOUT_MS)):
@@ -315,6 +350,7 @@ async def _walk_viewer(page, cur: dict | None, *, photo_cap: int, max_items: int
                 hit.append("max_s")      # the lazy load ran out of walk time
             else:
                 end_tiles = await page.evaluate(_GRID_COUNT)
+                why = f"end tiles={end_tiles}"
             break
         if photo_cap and photos >= photo_cap:
             hit.append("photo_cap")
@@ -326,15 +362,35 @@ async def _walk_viewer(page, cur: dict | None, *, photo_cap: int, max_items: int
             hit.append("max_s")
             break
         prev = {**await _snap(page), "known": list(known)}
+        t_i = time.monotonic()
         await _click_next(page, _ms_left(deadline, 3_000))
         cur = await _wait_item(page, prev, _ms_left(deadline, ITEM_TIMEOUT_MS))
+        if cur is None and ITEM_RETRY and time.monotonic() < deadline:
+            d = await page.evaluate(_TIMEOUT_DIAG, prev) or {}
+            if not d.get("key_changed"):   # experiment: assume the click was lost
+                await _click_next(page, _ms_left(deadline, 3_000))
+        rest = ITEM_MAX_MS - int((time.monotonic() - t_i) * 1000)
+        if cur is None and rest > 0 and time.monotonic() < deadline:
+            cur = await _wait_item(page, {**prev, "same_cap": True}, _ms_left(deadline, rest))
+        if cur is None:
+            d = await page.evaluate(_TIMEOUT_DIAG, prev)
+            logger.info("walk.item_timeout n=%d ms=%d diag=%s", len(items),
+                        int((time.monotonic() - t_i) * 1000), json.dumps(d))
+        item_ms.append(int((time.monotonic() - t_i) * 1000) * (1 if cur else -1))
+        stuck = stuck + 1 if cur is None else 0
+        if stuck >= ITEM_STUCK > 0:
+            items.append(dict(_UNKNOWN))
+            unknown += 1
+            hit.append("item_stuck")
+            break
         if cur is None and time.monotonic() >= deadline:
             items.append(dict(_UNKNOWN))     # the failed step still counts (item_timeout)
             unknown += 1
             hit.append("max_s")
             break
+    logger.info("walk.end reason=%s items=%d unknown=%d hit=%s", why, len(items), unknown, hit)
     return items, {"limits_hit": hit, "unknown": unknown, "photos": photos,
-                   "end_tiles": end_tiles}
+                   "end_tiles": end_tiles, "item_ms": item_ms}
 
 
 def _stalled(n_items: int, end_tiles: int | None, chips: bool) -> bool:
@@ -397,7 +453,7 @@ async def _walk_tab(page, label: str | None, photo_cap: int, max_items: int, max
         cur = await _wait_item(page, prev, _ms_left(deadline, CHIP_FIRST_MS))
         if cur is None and await page.evaluate(_CLICK_TILE0):
             cur = await _wait_item(page, {**prev, "same_ok": True},
-                                   _ms_left(deadline, ITEM_TIMEOUT_MS))
+                                   _ms_left(deadline, TILE0_TIMEOUT_MS))
     items, meta = await _walk_viewer(page, cur, photo_cap=photo_cap, max_items=max_items,
                                      deadline=deadline, known=known)
     meta["ms"] = int((time.monotonic() - t0) * 1000)
@@ -427,6 +483,7 @@ async def _walk_gallery(page, chips: list[str], wm: dict, photo_cap: int, max_it
 
     def add(walked, source, chip, meta):
         wm["timings"][chip or "current"] = meta["ms"]
+        wm.setdefault("item_ms", {})[chip or "current"] = meta.get("item_ms", [])
         for h in meta["limits_hit"]:
             if h not in wm["limits_hit"]:
                 wm["limits_hit"].append(h)
@@ -445,40 +502,73 @@ async def _walk_gallery(page, chips: list[str], wm: dict, photo_cap: int, max_it
                 keys.add(k)
             items.append({**it, "source": source, "chip": chip, "ordinal": len(items)})
 
+    # ONE budget (time, items, photos) for every chip walk of this gallery, from the
+    # first one: the per-place worst case is a single walk's. Menu-chip photos are
+    # tagged, never mirrored, so they spend time and items but not the photo cap.
+    end, left = time.monotonic() + max_s, {"photos": photo_cap, "items": max_items}
+
+    def budget(cap: int, photos: bool = True):
+        """(photo cap, item cap, seconds) for the next chip walk; None = spent (recorded)."""
+        s_left = end - time.monotonic()
+        out = ("photo_cap" if photos and photo_cap and left["photos"] <= 0 else
+               "max_items" if left["items"] <= 0 else "max_s" if s_left <= 0 else None)
+        if out:
+            if out not in wm["limits_hit"]:
+                wm["limits_hit"].append(out)
+            return None
+        if photos and photo_cap:
+            cap = min(cap, left["photos"]) if cap else left["photos"]
+        return cap, left["items"], s_left
+
+    def spend(res, photos: bool = True):
+        left["items"] -= len(res[0])
+        if photos:
+            left["photos"] -= res[1]["photos"]
+
     clicked = False
-    if owner:
-        res = await _walk_tab(page, owner, OWNER_PHOTO_CAP, max_items, max_s, first_click=True,
-                              entry=entry)
+    b = budget(OWNER_PHOTO_CAP) if owner else None
+    if b:
+        res = await _walk_tab(page, owner, *b, first_click=True, entry=entry)
         clicked = True
         if res is None:
             wm["chip_unavailable"] = 1
         else:
+            spend(res)
             add(res[0], "owner", owner, res[1])
             wm["owner_count"] = res[1]["photos"]
             wm["owner_count_known"] = not res[1]["limits_hit"] and not res[1]["unknown"]
-    else:
+    elif not owner:
         # Chips listed without "By owner": no owner photos. No chips at all (the
         # gallery sometimes renders without them, seen live): owner count unknown.
         wm["owner_count_known"] = bool(chips)
-    if menu:
+    b = budget(MENU_CHIP_CAP, photos=False) if menu else None
+    if b:
         # Menu chip: walked before the gallery so its photos keep chip="Menu" (a key
         # is added once) and gallery_select skips them. Not a gallery walk.
-        res = await _walk_tab(page, menu, MENU_CHIP_CAP, max_items, max_s,
-                              first_click=not clicked, entry=entry, known=keys)
+        res = await _walk_tab(page, menu, *b, first_click=not clicked, entry=entry, known=keys)
         clicked = True
         if res is not None:
+            spend(res, photos=False)
             add(res[0], "menu", menu, res[1])
             wm["menu_count"] = res[1]["photos"]
     ran = False
     for chip in (c for c in (latest, allc) if c):
-        res = await _walk_tab(page, chip, photo_cap, max_items, max_s, first_click=not clicked,
-                              entry=entry, known=keys)
+        b = budget(photo_cap)
+        if not b:
+            break
+        res = await _walk_tab(page, chip, *b, first_click=not clicked, entry=entry, known=keys)
         clicked = True
         if res is None:
             wm["chip_unavailable"] = 1        # skipped Latest falls back to All
             continue
+        spend(res)
         add(res[0], "gallery", chip, res[1])
         ran = True
+        if chip is latest and set(res[1]["limits_hit"]) <= {"item_stuck"}:
+            # Latest is only the recent items (live: 1 tile on a 100+ photo cafe, p200
+            # kept 1 photo): walked to its end (or stuck), All follows for the rest
+            # (keys dedup) within what is left of the budget.
+            continue
         break
     if not (owner or latest or allc):
         # No chips at all (seen live, Oct 2026): the open stream is the gallery.
@@ -487,7 +577,8 @@ async def _walk_gallery(page, chips: list[str], wm: dict, photo_cap: int, max_it
         ran = True
     wm["walk_ok"] = ran
     if not ran:
-        wm["reason"] = "chip_unavailable"
+        spent = [h for h in ("photo_cap", "max_items", "max_s") if h in wm["limits_hit"]]
+        wm["reason"] = "budget_spent" if spent and (latest or allc) else "chip_unavailable"
     for h in wm["limits_hit"]:
         wm["truncated_reasons"].append(h)
     wm["truncated"] = int(bool(wm["truncated_reasons"]))

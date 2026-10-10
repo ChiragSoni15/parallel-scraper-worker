@@ -466,23 +466,43 @@ class PlaywrightSession:
         """Get a full page back after a degraded render. `reload_and_check` is an async
         fn that re-opens the place and returns (full, result). A new context seeded with
         the good cookies first (when there are any), then, if still degraded, a browser
-        relaunch (~20 s, ~half recover). Returns (method of the last attempt, its result)."""
+        relaunch (~20 s, ~half recover). Returns (method, result of the last attempt):
+        cookie_context | relaunch_no_cookies (nothing full seen yet in this browser:
+        unavoidable) | relaunch_after_cookie (the seeded context stayed degraded).
+        p200 logged only the last step: 19 of 30 unrecovered retries took ~34 s (seeded
+        try + relaunch) against ~18 s (relaunch only), all recorded as 'relaunch'."""
+        reason = "relaunch_no_cookies"
         if self._good_cookies and self._browser is not None:
+            t0 = time.monotonic()
+            full = False
             try:
                 self._loop.run_until_complete(self._seeded_context())
                 full, res = self._loop.run_until_complete(reload_and_check())
-                if full:
-                    return "cookie_context", res
             except Exception:
                 logger.warning("phase2_session.cookie_context_failed", exc_info=True)
-            # These cookies did not unlock the page: relaunch unseeded (a fresh draw).
-            self._good_cookies = []
-        self._close_browser()
-        self._open_browser()
-        full, res = self._loop.run_until_complete(reload_and_check())
-        if full:
-            self._loop.run_until_complete(self._remember_good())
-        return "relaunch", res
+            logger.info("phase2_session.degraded_recovery step=cookie_context ok=%d cookies=%d ms=%d",
+                        int(full), len(self._good_cookies), int((time.monotonic() - t0) * 1000))
+            if full:
+                return "cookie_context", res
+            # Still degraded: relaunch unseeded (a fresh draw). The saved cookies are set
+            # aside only for the launch and always put back: the caller replaces them
+            # once a walk on the new session proves it full (_remember_good).
+            kept, self._good_cookies = self._good_cookies, []
+            reason = "relaunch_after_cookie"
+        t0 = time.monotonic()
+        full = False
+        try:
+            self._close_browser()
+            self._open_browser()
+            full, res = self._loop.run_until_complete(reload_and_check())
+        finally:   # success, failure or an exception: the old cookies stay until a proof
+            if reason == "relaunch_after_cookie":
+                self._good_cookies = kept
+        logger.info("phase2_session.degraded_recovery step=%s ok=%d ms=%d", reason, int(full),
+                    int((time.monotonic() - t0) * 1000))
+        # No _remember_good here: a full tab strip can sit on a degraded gallery (live),
+        # so the caller stores cookies only after a full walk.
+        return reason, res
 
     def recycle(self) -> None:
         """Recycle between scrape batches. Page-only by default (fast, keeps
@@ -616,8 +636,6 @@ class PlaywrightSession:
                 method, ex = self._recover_degraded(_retry)
                 logger.info("phase2_session.panel_degraded place_id=%s method=%s recovered=%d",
                             place_id, method, int(not ex.get("degraded")))
-            else:
-                self._loop.run_until_complete(self._remember_good())
             return ex
         except Exception:
             logger.warning("phase2_session.panel_extras_failed place_id=%s",
@@ -640,7 +658,7 @@ class PlaywrightSession:
         seeded with the last full page's cookies, else a relaunched browser) within the
         same PHASE2_WALK_MAX_S budget; an unrecovered retry keeps the walk with more
         items. walk_meta gets degraded_retry=1, degraded_recovered,
-        degraded_recovery_method (cookie_context|relaunch) (and degraded_panel=1 when the tabs
+        degraded_recovery_method (cookie_context|relaunch_no_cookies|relaunch_after_cookie) (and degraded_panel=1 when the tabs
         were degraded); the scrape() panel data is kept either way."""
         import os as _os
         if not self._page_alive():
@@ -681,12 +699,22 @@ class PlaywrightSession:
                 await self._page.wait_for_timeout(500)
             await self._page.wait_for_timeout(1_500)
 
-        def _hc_empty() -> dict:
-            return {"items": [], "walk_meta": _hc._new_walk_meta(None)}
-
         def _degraded(labels: list[str]) -> bool:
-            # Degraded session render: the panel tab strip is Overview + Reviews only.
+            # Degraded session render: no About/Photos panel tab. A Menu tab is no proof
+            # of a full page (it does not show the gallery is complete): such a page
+            # stays eligible for recovery unless _proof holds.
             return not any(lbl.startswith(("About", "Photos")) for lbl in labels)
+
+        def _bare(labels: list[str]) -> bool:
+            # Overview + Reviews only: its walk never beats the first one (live: 0-9 items).
+            return not any(lbl.startswith(("About", "Photos", "Menu")) for lbl in labels)
+
+        def _proof(h: dict) -> bool:
+            # Positive proof of a full session: the gallery showed chips AND the walk
+            # loaded >= 3 items with no unknown (a partial render can show chips).
+            wm = h.get("walk_meta") or {}
+            return (bool(wm.get("chips_seen")) and len(h.get("items") or []) >= 3
+                    and not wm.get("unknown_count"))
 
         try:
             labels = self._loop.run_until_complete(_tabs())
@@ -696,8 +724,20 @@ class PlaywrightSession:
             # Walk first even on a degraded panel: a re-goto that lands degraded again
             # walked 0 items live (Glamour), the post-scrape preview walks ~9.
             hc = self._loop.run_until_complete(_do(max_s))
-            if not (bad_panel or hc["walk_meta"].get("degraded_gallery")):
-                self._loop.run_until_complete(self._remember_good())
+            wm0 = hc["walk_meta"]
+            # A proven full walk (chips + >= 3 items, no unknown) is a full render whatever
+            # the tab strip (small places have no About tab): the retry only re-walks, so
+            # skip it (p200: 7 of 30 unrecovered retries had chips, ~34 s each). Else the
+            # tab test decides.
+            proof = _proof(hc)
+            full = not wm0.get("degraded_gallery") and (proof or not bad_panel)
+            if full:
+                # Cookies are kept only after a proven walk: a degraded session can show
+                # an About tab over a chipless gallery of any size (live), and a stored
+                # degraded jar made every seeded retry reproduce it.
+                bad_panel = False
+                if proof:
+                    self._loop.run_until_complete(self._remember_good())
             else:
                 left = max_s - int(time.monotonic() - t_start)
                 if left >= DEGRADED_RETRY_MIN_S:
@@ -717,13 +757,22 @@ class PlaywrightSession:
                         method, labels2 = self._recover_degraded(_retry)
                         logger.info("phase2_session.panel_tabs place_id=%s retry=1 tabs=%s", place_id,
                                     ",".join(labels2)[:200])
-                        left = max(1, max_s - int(time.monotonic() - t_start))
-                        # Still degraded: its walk never beats the first one (live: 0-9 items).
-                        hc2 = (_hc_empty() if _degraded(labels2)
-                               else self._loop.run_until_complete(_do(left)))
-                        wm2 = hc2["walk_meta"]
-                        recovered = (not _degraded(labels2) and not wm2.get("degraded_gallery")
-                                     and bool(hc2.get("items")))
+                        left = max_s - int(time.monotonic() - t_start)
+                        # Always re-walked within the budget left, whatever the tab strip;
+                        # only the walk proof says recovered (degraded_gallery is recorded,
+                        # not an input). A bare strip is logged only. No budget left: no walk.
+                        bare = _bare(labels2)
+                        if left <= 0:
+                            hc2 = {"items": [], "walk_meta": {}}
+                            recovered = False
+                            hc["walk_meta"]["degraded_rewalk_skipped"] = "budget_spent"
+                        else:
+                            hc2 = self._loop.run_until_complete(_do(left))
+                            recovered = _proof(hc2)
+                        logger.info("phase2_session.degraded_rewalk place_id=%s bare=%d proof=%d items=%d",
+                                    place_id, bare, recovered, len(hc2.get("items") or []))
+                        if recovered:
+                            self._loop.run_until_complete(self._remember_good())
                         if recovered or len(hc2.get("items") or []) > len(hc.get("items") or []):
                             hc = hc2
                         hc["walk_meta"]["degraded_retry"] = 1

@@ -17,7 +17,7 @@ from typing import Callable
 
 MAX_AGE_DAYS = 1095          # "3 years old or newer"
 MAX_UNIQUE_THUMBS = 120      # §3: items after 120 unique thumbs get dhash=None
-STALE_MAX = 2                # band (e) takes at most 2 ...
+STALE_MAX = 2                # band (e) takes at most 2 old photos (owner first) ...
 STALE_MIN_KEPT = 3           # ... and only when fewer than 3 are kept after (a)-(d)
 OWNER_OLD_MAX = 20           # band (b) only when owner_count <= 20
 CATEGORY_FIRST = {"storefront", "interior"}
@@ -205,11 +205,10 @@ def select_photos(items, *, now, cap: int = 20, thresh: int = 8,
             bands["d"].append(g)
         elif (today - _month_start(g["month"])).days <= MAX_AGE_DAYS:
             bands["a" if owner else "c"].append(g)
-        elif owner:
-            if owner_old_ok:
-                bands["b"].append(g)
+        elif owner and owner_old_ok:
+            bands["b"].append(g)
         else:
-            bands["e"].append(g)
+            bands["e"].append(g)          # old gallery, or old owner when count > 20
 
     def band_key(g):  # category tie-break only reorders inside a band
         return _newest_first_key(g, 0 if g["chip"] in CATEGORY_FIRST else 1)
@@ -220,7 +219,8 @@ def select_photos(items, *, now, cap: int = 20, thresh: int = 8,
             if len(out) < cap:
                 out.append(_to_selected(g, b))
     if len(out) < STALE_MIN_KEPT:
-        for g in sorted(bands["e"], key=band_key)[:STALE_MAX]:
+        # owner before gallery inside the fallback (orchestrator, 11 Oct)
+        for g in sorted(bands["e"], key=lambda g: ("owner" not in g["sources"], band_key(g)))[:STALE_MAX]:
             if len(out) < cap:
                 out.append(_to_selected(g, "e"))
     return out
