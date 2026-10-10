@@ -302,26 +302,46 @@ def _flush_attrs(state, run_id, pend_attrs):
 
 def _lease_with_retry(state, run_id, shard, batch, attempts: int = 5,
                       deadline: float | None = None):
-    """Claim a batch, retrying on empty results. Empty lease != empty queue:
-    with concurrent claimers (multiple API replicas / fleets) the READPAST
-    claim can skip locked rows and return nothing while thousands remain
-    queued. Backs off 15/30/45/60s (+shard jitter) before concluding dry.
+    """Claim a batch, retrying on empty results. Empty lease != empty queue.
 
-    `deadline` is a time.monotonic() stamp past which backing off is pointless —
-    the shard is out of budget and will exit on the next loop anyway. Without it
-    a drained shard blocks ~150s at the end of every run, and any caller with no
-    time left (max_minutes=0) waits out the full ladder before returning.
+    The API (design §9.2) answers an empty lease with `pending`: true while the run
+    still has queued or scraping rows (held in another API pod's buffer, READPAST-
+    skipped, or in flight on live shards that may release them). Then sleep its
+    `retry_after_s` and retry, up to PHASE2_EMPTY_LEASE_MAX_WAIT_S (600) in total;
+    `pending` false means drained, so return at once. Pilot p200: a shard whose
+    lease hit a pod with nothing buffered exited after the old ladder while 52 rows
+    were still 'scraping' in another pod's buffer.
+
+    A response without `pending` (an API not yet redeployed, or a state backend that
+    is not HTTP) keeps the old ladder: back off 15/30/45/60s (+shard jitter).
+
+    `deadline` is a time.monotonic() stamp past which waiting is pointless — the
+    shard is out of budget and will exit on the next loop anyway.
     """
-    for i in range(attempts):
+    max_wait = float(os.environ.get("PHASE2_EMPTY_LEASE_MAX_WAIT_S") or 600)
+    waited, i = 0.0, 0
+    while True:
         leased = state.claim_place_ids(run_id, str(shard), int(batch))
         if leased:
             return leased
-        if i + 1 >= attempts:
-            break
         if deadline is not None and time.monotonic() >= deadline:
-            break
-        time.sleep(min(60.0, 15.0 * (i + 1)) + (hash(str(shard)) % 7))
-    return []
+            return []
+        info = getattr(state, "last_lease", None)
+        pending = info.get("pending") if isinstance(info, dict) else None
+        if pending is None:                     # old API / non-HTTP backend
+            i += 1
+            if i >= attempts:
+                return []
+            time.sleep(min(60.0, 15.0 * i) + (hash(str(shard)) % 7))
+            continue
+        if not pending or waited >= max_wait:
+            if pending:
+                logger.info("phase2.lease_wait_exhausted run_id=%s shard=%s waited=%.0fs",
+                            run_id, shard, waited)
+            return []
+        pause = max(1.0, float(info.get("retry_after_s") or 15))
+        time.sleep(pause)
+        waited += pause
 
 
 def _resolve_concurrency(concurrency) -> int:

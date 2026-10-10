@@ -84,7 +84,9 @@ jobs:
           prog=$(curl -fsS $cacert -H "Authorization: Bearer ${WORKER_TOKEN}" \
                    "${base}/phase2/progress?run_id=${RUN_ID}")
           echo "progress: ${prog}"
-          pending=$(echo "$prog" | jq '((.queued // 0) + (.failed // 0))')
+          # scraping counts: rows held in an API pod's lease buffer or by dead shards come
+          # back via release/reclaim, and the shards wait for them (pending=true leases).
+          pending=$(echo "$prog" | jq '((.queued // 0) + (.failed // 0) + (.scraping // 0))')
           if [ "$pending" -eq 0 ]; then
             matrix='[]'
           else

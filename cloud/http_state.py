@@ -18,6 +18,7 @@ class HttpState:
         self.base = (base or os.environ["WORKER_API_BASE"]).rstrip("/")
         self.token = token or os.environ["WORKER_TOKEN"]
         self.timeout = timeout
+        self.last_lease: dict = {}   # last /phase2/lease body: pending / retry_after_s on empty
         self._s = requests.Session()
         self._s.headers["Authorization"] = f"Bearer {self.token}"
         # When the API uses a self-signed cert (e.g. Azure static IP, no domain), pin it:
@@ -69,6 +70,7 @@ class HttpState:
     def claim_place_ids(self, run_id: str, worker, n: int) -> list[dict]:
         out = self._request("POST", "/phase2/lease",
                             json={"run_id": run_id, "worker": str(worker), "n": int(n)})
+        self.last_lease = out
         return out.get("pids", [])
 
     def submit(self, run_id: str, done: list[dict], failed: list[dict]) -> dict:
