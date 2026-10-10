@@ -166,8 +166,12 @@ class LocalAPIKeyManager:
         self._last_429_monotonic = 0.0
         self._last_ramp_monotonic = time.monotonic()
         self._ramp_after_s = 120.0
-        self._ramp_every_s = 60.0
-        self._ramp_step = 0.03
+        # Recovery pace after a 429 backoff: +0.06 every 30s climbs from the
+        # 0.55 floor back to 0.85 in ~2.5 min (was 0.03/60s = ~10 min of idled
+        # capacity). Any new 429 re-backs-off immediately, so the faster ramp
+        # carries the same safety.
+        self._ramp_every_s = 30.0
+        self._ramp_step = 0.06
         self._cooldown_s = max(1, int(cooldown_s))
         self._t429_threshold = max(1, int(t429_threshold))
         self._target_rps = 0.0

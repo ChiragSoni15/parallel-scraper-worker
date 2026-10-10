@@ -548,20 +548,24 @@ class PlaywrightSession:
         scrape(place_id) while the panel is still open. ALWAYS on: every place
         gets {"photo_dates": {place_photos, imagery, errors}}. With env
         PHASE2_HORECA=1 the Menu tab is walked first and {"horeca": {...menu}}
-        is added. PHASE2_PHOTO_DATES_CAP (default 0 = all) / PHASE2_HORECA_PHOTO_CAP
-        (menu, default 12). Returns None only when the page is dead; never raises."""
+        is added. Walk limits per chip walk (design §5): PHASE2_WALK_PHOTO_CAP
+        (photos, default 40, 0 = no cap), PHASE2_WALK_MAX_ITEMS (120), PHASE2_WALK_MAX_S
+        (90). PHASE2_HORECA_PHOTO_CAP (menu, default 12). photo_dates also carries
+        `items` and `walk_meta`. Returns None only when the page is dead; never raises."""
         import os as _os
         if not self._page_alive():
             return None
-        from parallel_scraper.horeca_capture import (PHOTO_CAP_DEFAULT,
-                                                     PLACE_PHOTO_CAP_DEFAULT, capture_horeca)
+        from parallel_scraper import horeca_capture as _hc
         with_menu = _os.environ.get("PHASE2_HORECA", "0") == "1"
-        menu_cap = int(_os.environ.get("PHASE2_HORECA_PHOTO_CAP", PHOTO_CAP_DEFAULT))
-        place_cap = int(_os.environ.get("PHASE2_PHOTO_DATES_CAP", PLACE_PHOTO_CAP_DEFAULT))
+        menu_cap = int(_os.environ.get("PHASE2_HORECA_PHOTO_CAP", _hc.PHOTO_CAP_DEFAULT))
+        place_cap = int(_os.environ.get("PHASE2_WALK_PHOTO_CAP", _hc.WALK_PHOTO_CAP_DEFAULT))
+        max_items = int(_os.environ.get("PHASE2_WALK_MAX_ITEMS", _hc.WALK_MAX_ITEMS_DEFAULT))
+        max_s = int(_os.environ.get("PHASE2_WALK_MAX_S", _hc.WALK_MAX_S_DEFAULT))
 
         async def _do() -> dict:
-            return await capture_horeca(self._page, photo_cap=menu_cap, with_menu=with_menu,
-                                        place_photo_cap=place_cap)
+            return await _hc.capture_horeca(self._page, photo_cap=menu_cap, with_menu=with_menu,
+                                            place_photo_cap=place_cap, walk_max_items=max_items,
+                                            walk_max_s=max_s)
 
         try:
             hc = self._loop.run_until_complete(_do())
@@ -569,7 +573,8 @@ class PlaywrightSession:
             logger.warning("phase2_session.media_capture_failed place_id=%s",
                            place_id, exc_info=True)
             return None
-        out = {"photo_dates": {k: hc.get(k) for k in ("place_photos", "imagery", "entry")}}
+        out = {"photo_dates": {k: hc.get(k) for k in ("place_photos", "imagery", "entry",
+                                                          "items", "walk_meta")}}
         out["photo_dates"]["errors"] = [e for e in hc["errors"] if e.startswith("place_photos")]
         if with_menu:
             out["horeca"] = {k: hc.get(k) for k in ("menu_link", "website", "menu_photos")}
@@ -584,6 +589,20 @@ class PlaywrightSession:
             return None
         return {**(m.get("horeca") or {}), **m["photo_dates"],
                 "errors": (m.get("horeca") or {}).get("errors", []) + m["photo_dates"]["errors"]}
+
+    def page_state(self, with_text: bool = False) -> tuple[str, str]:
+        """(page.url, body text or '') of the current page, for failure logs and the
+        delisted check (design §8.4, §9). ('', '') when the page is gone; never raises."""
+        try:
+            if not self._page_alive():
+                return "", ""
+            text = ""
+            if with_text:
+                text = self._loop.run_until_complete(self._page.evaluate(
+                    "() => document.body ? document.body.innerText : ''")) or ""
+            return self._page.url or "", text
+        except Exception:
+            return "", ""
 
     def screenshot_paths(self, place_id: str) -> dict:
         """Return {kind: png_path} for the panel screenshots captured for this place

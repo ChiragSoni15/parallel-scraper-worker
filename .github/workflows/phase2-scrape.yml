@@ -20,8 +20,13 @@ on:
       screenshots: { required: false, type: string, default: "1" }   # 0 = no panel screenshots (backfill passes)
       photos:      { required: false, type: string, default: "1" }   # 0 = no CDN->blob photo mirroring
       batch:       { required: false, type: string, default: "20" }
-      photo_dates_cap: { required: false, type: string, default: "" }  # 0 = walk every photo (slow)  # placeIds per lease call
+      photo_dates_cap: { required: false, type: string, default: "" }  # legacy alias of walk_photo_cap
       flush_s:     { required: false, type: string, default: "20" }  # seconds between result/attribute POSTs
+      # Walk limits (design §5). Empty = the code default; never a workflow default here.
+      walk_photo_cap: { required: false, type: string, default: "" }  # PHASE2_WALK_PHOTO_CAP (0 = no photo cap)
+      walk_max_items: { required: false, type: string, default: "" }  # PHASE2_WALK_MAX_ITEMS
+      walk_max_s:     { required: false, type: string, default: "" }  # PHASE2_WALK_MAX_S
+      shard_max_fail: { required: false, type: string, default: "" }  # PHASE2_SHARD_MAX_FAIL (fraction, code default 0.10)
   # MANUAL DISPATCH ONLY. The 30-minute self-drain cron was removed: with 21
   # fleet repos it meant every one of them picked up a run within half an hour of
   # ACTIVE_RUN_ID being set, which is far more concurrency than the lease API can
@@ -100,7 +105,14 @@ jobs:
       matrix:
         shard: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
+      # STARTUP <name>=<epoch> lines are read by tools/startup_report.py (design §9.3).
+      - name: Startup marker
+        run: echo "STARTUP t_job_start=$(date +%s)"
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Checkout marker
+        run: echo "STARTUP t_checkout=$(date +%s)"
       - name: Pin VM self-signed cert if present
         run: |
           if [ -f "$GITHUB_WORKSPACE/worker_ca.pem" ]; then
@@ -110,11 +122,34 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # Keyed on uv.lock; the public worker repo may only carry pyproject.toml, so hash both.
+      - name: Cache pip/uv downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/uv
+          key: pydeps-${{ runner.os }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+      - name: Cache Playwright browsers
+        id: pw
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
       - name: Install deps (Playwright only — NO DB driver, NO Drive)
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          python -m playwright install --with-deps chromium
+          echo "STARTUP t_deps=$(date +%s)"
+      - name: Install Playwright chromium (cache miss only)
+        if: steps.pw.outputs.cache-hit != 'true'
+        run: python -m playwright install --with-deps chromium
+      # The cache holds browser files only; a fresh runner still needs the system libs.
+      - name: Install Playwright system deps (cache hit)
+        if: steps.pw.outputs.cache-hit == 'true'
+        run: python -m playwright install-deps chromium
+      - name: Playwright marker
+        run: echo "STARTUP t_playwright=$(date +%s)"
       - name: Scrape (API mode)
         env:
           WORKER_API_BASE: ${{ vars.WORKER_API_BASE }}
@@ -128,15 +163,12 @@ jobs:
           # Mirror each place's photos (Google CDN -> Blob) under <run_id>/<place_id>/.
           # Best-effort; "0" disables. Cap keeps per-place time bounded.
           PHASE2_PHOTOS_TO_BLOB: "${{ inputs.photos || '1' }}"
-          PHASE2_PHOTOS_MAX: "15"
-          # Cap the photo-DATE gallery walk. Default in code is 0 = walk EVERY
-          # gallery item at ~0.7s each, which measured 63% of total per-place
-          # time on parleagro_Bihar (avg 25 photos = 17.5s of a 27.8s budget)
-          # while only PHASE2_PHOTOS_MAX (15) are ever mirrored and ~2.6 URLs
-          # kept. The tail is brutal: 1.9% of places have >200 photos and one
-          # had 239,310, which can never finish inside a lease. 30 keeps dates
-          # for twice what is mirrored and cuts the walk to ~4.5s.
-          PHASE2_PHOTO_DATES_CAP: "${{ inputs.photo_dates_cap || vars.ACTIVE_PHOTO_DATES_CAP || '30' }}"
+          # Walk limits (design §5): exported only when set, else the code default wins.
+          # (The old workflow '30' / repo var ACTIVE_PHOTO_DATES_CAP fallback is gone.)
+          IN_WALK_PHOTO_CAP: "${{ inputs.walk_photo_cap || inputs.photo_dates_cap }}"
+          IN_WALK_MAX_ITEMS: "${{ inputs.walk_max_items }}"
+          IN_WALK_MAX_S: "${{ inputs.walk_max_s }}"
+          IN_SHARD_MAX_FAIL: "${{ inputs.shard_max_fail }}"
           # Fallback staging (also catches individual failed blob PUTs): save PNGs + a
           # manifest to this dir; the step below uploads it as a build artifact, drained
           # later by cloud/drain_screenshots.py. When every PUT lands in Blob the dir
@@ -151,12 +183,18 @@ jobs:
           PHASE2_PANEL_EXTRAS: "${{ inputs.panel_extras || vars.ACTIVE_PANEL_EXTRAS || '0' }}"
           PHASE2_MENU_TAB: "${{ inputs.menu_tab || vars.ACTIVE_MENU_TAB || '1' }}"
           PHASE2_FLUSH_INTERVAL_S: "${{ inputs.flush_s || '20' }}"
-        run: >
-          python -m cloud.phase2_worker_api
-          --run-id "${{ inputs.run_id || vars.ACTIVE_RUN_ID }}"
-          --shard "${{ matrix.shard }}"
-          --max-minutes "${{ inputs.max_minutes || '300' }}"
-          --concurrency "${{ inputs.concurrency || vars.ACTIVE_CONCURRENCY || '3' }}"           --batch "${{ inputs.batch || '20' }}"
+        # Exit 3 = this shard lost work (design §9 level 1); the run gate is in the sequencer.
+        run: |
+          [ -n "$IN_WALK_PHOTO_CAP" ] && export PHASE2_WALK_PHOTO_CAP="$IN_WALK_PHOTO_CAP"
+          [ -n "$IN_WALK_MAX_ITEMS" ] && export PHASE2_WALK_MAX_ITEMS="$IN_WALK_MAX_ITEMS"
+          [ -n "$IN_WALK_MAX_S" ] && export PHASE2_WALK_MAX_S="$IN_WALK_MAX_S"
+          [ -n "$IN_SHARD_MAX_FAIL" ] && export PHASE2_SHARD_MAX_FAIL="$IN_SHARD_MAX_FAIL"
+          python -m cloud.phase2_worker_api \
+            --run-id "${{ inputs.run_id || vars.ACTIVE_RUN_ID }}" \
+            --shard "${{ matrix.shard }}" \
+            --max-minutes "${{ inputs.max_minutes || '300' }}" \
+            --concurrency "${{ inputs.concurrency || vars.ACTIVE_CONCURRENCY || '3' }}" \
+            --batch "${{ inputs.batch || '20' }}"
 
       # The durable screenshot queue: each shard's captured PNGs + manifest.jsonl, uploaded
       # off the ephemeral runner. Drained to Drive later by cloud/drain_screenshots.py.

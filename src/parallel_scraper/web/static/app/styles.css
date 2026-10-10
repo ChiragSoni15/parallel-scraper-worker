@@ -715,6 +715,12 @@ input, select, textarea { font-family: inherit; font-size: inherit; color: inher
     linear-gradient(120deg, oklch(0.94 0.01 220) 0%, oklch(0.90 0.01 200) 100%);
 }
 
+/* Dark basemap = OSM tiles inverted (CARTO's dark tiles need an API key now).
+   Only the tile pane is filtered; overlays/markers keep their real colours. */
+.map-area[data-mapstyle="dark"] .leaflet-tile-pane {
+  filter: invert(1) hue-rotate(180deg) brightness(0.72) contrast(0.95) saturate(0.35);
+}
+
 [data-mapstyle="satellite"] .map-tiles {
   background-color: oklch(0.18 0.01 100);
   background-image:

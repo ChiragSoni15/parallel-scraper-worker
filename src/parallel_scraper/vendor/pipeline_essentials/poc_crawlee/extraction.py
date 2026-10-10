@@ -7,11 +7,14 @@ Strategy: Hybrid JS injection + Playwright interactions.
 - URL regex for coordinates
 """
 
+import os
 import re
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
 
+from parallel_scraper import normalise as nz
 from .models import PlaceData
 
 logger = logging.getLogger(__name__)
@@ -102,6 +105,21 @@ MINIMAL_EXTRACT_JS = """
                 || document.querySelector('h1.DUwDvf')
                 || document.querySelector('h1');
     r.name = nameEl ? nameEl.textContent.trim() : 'N/A';
+
+    // Secondary/local name: Maps renders it as an <h2> sibling of the <h1> inside
+    // div.lMbq3e -> <h1>The taste of tea</h1><h2 class="bwoZTb">مذاق الشاي</h2>
+    // We send accept-language=en, so the h1 is the ENGLISH name when the business
+    // registered one and falls back to the local name when it did not. Without this
+    // the same brand splits across an English-titled row and an Arabic-titled row
+    // with no id to join on (Starbucks / ستاربكس, The taste of tea / مذاق الشاي).
+    // Scoped to the h1's own container on purpose: a listing page has ~12 <h2>s.
+    r.name_local = '';
+    if (nameEl) {
+        const box = nameEl.closest('div.lMbq3e') || (nameEl.parentElement && nameEl.parentElement.parentElement);
+        const h2 = box ? (box.querySelector('h2.bwoZTb') || box.querySelector('h2')) : null;
+        const t = h2 ? h2.textContent.trim() : '';
+        if (t && t !== r.name) r.name_local = t;
+    }
     r.status = 'Open';
     const statusEl = document.querySelector('span.fCEvvc')
                   || document.querySelector('span.aSftqf')
@@ -134,6 +152,21 @@ LEAN_EXTRACT_JS = """
                 || document.querySelector('h1.DUwDvf')
                 || document.querySelector('h1');
     r.name = nameEl ? nameEl.textContent.trim() : 'N/A';
+
+    // Secondary/local name: Maps renders it as an <h2> sibling of the <h1> inside
+    // div.lMbq3e -> <h1>The taste of tea</h1><h2 class="bwoZTb">مذاق الشاي</h2>
+    // We send accept-language=en, so the h1 is the ENGLISH name when the business
+    // registered one and falls back to the local name when it did not. Without this
+    // the same brand splits across an English-titled row and an Arabic-titled row
+    // with no id to join on (Starbucks / ستاربكس, The taste of tea / مذاق الشاي).
+    // Scoped to the h1's own container on purpose: a listing page has ~12 <h2>s.
+    r.name_local = '';
+    if (nameEl) {
+        const box = nameEl.closest('div.lMbq3e') || (nameEl.parentElement && nameEl.parentElement.parentElement);
+        const h2 = box ? (box.querySelector('h2.bwoZTb') || box.querySelector('h2')) : null;
+        const t = h2 ? h2.textContent.trim() : '';
+        if (t && t !== r.name) r.name_local = t;
+    }
 
     const ratingEl = document.querySelector('div.F7nice span[aria-hidden="true"]');
     r.rating = ratingEl ? ratingEl.textContent.trim() : 'N/A';
@@ -219,6 +252,21 @@ LEAN_ENRICH_JS = """
                 || document.querySelector('h1.DUwDvf')
                 || document.querySelector('h1');
     r.name = nameEl ? nameEl.textContent.trim() : 'N/A';
+
+    // Secondary/local name: Maps renders it as an <h2> sibling of the <h1> inside
+    // div.lMbq3e -> <h1>The taste of tea</h1><h2 class="bwoZTb">مذاق الشاي</h2>
+    // We send accept-language=en, so the h1 is the ENGLISH name when the business
+    // registered one and falls back to the local name when it did not. Without this
+    // the same brand splits across an English-titled row and an Arabic-titled row
+    // with no id to join on (Starbucks / ستاربكس, The taste of tea / مذاق الشاي).
+    // Scoped to the h1's own container on purpose: a listing page has ~12 <h2>s.
+    r.name_local = '';
+    if (nameEl) {
+        const box = nameEl.closest('div.lMbq3e') || (nameEl.parentElement && nameEl.parentElement.parentElement);
+        const h2 = box ? (box.querySelector('h2.bwoZTb') || box.querySelector('h2')) : null;
+        const t = h2 ? h2.textContent.trim() : '';
+        if (t && t !== r.name) r.name_local = t;
+    }
 
     const ratingEl = document.querySelector('div.F7nice span[aria-hidden="true"]');
     r.rating = ratingEl ? ratingEl.textContent.trim() : 'N/A';
@@ -366,6 +414,21 @@ async () => {
                 || document.querySelector('h1.DUwDvf')
                 || document.querySelector('h1');
     r.name = nameEl ? nameEl.textContent.trim() : 'N/A';
+
+    // Secondary/local name: Maps renders it as an <h2> sibling of the <h1> inside
+    // div.lMbq3e -> <h1>The taste of tea</h1><h2 class="bwoZTb">مذاق الشاي</h2>
+    // We send accept-language=en, so the h1 is the ENGLISH name when the business
+    // registered one and falls back to the local name when it did not. Without this
+    // the same brand splits across an English-titled row and an Arabic-titled row
+    // with no id to join on (Starbucks / ستاربكس, The taste of tea / مذاق الشاي).
+    // Scoped to the h1's own container on purpose: a listing page has ~12 <h2>s.
+    r.name_local = '';
+    if (nameEl) {
+        const box = nameEl.closest('div.lMbq3e') || (nameEl.parentElement && nameEl.parentElement.parentElement);
+        const h2 = box ? (box.querySelector('h2.bwoZTb') || box.querySelector('h2')) : null;
+        const t = h2 ? h2.textContent.trim() : '';
+        if (t && t !== r.name) r.name_local = t;
+    }
 
     // ── Rating (multi-strategy) ──
     r.rating = 'N/A';
@@ -649,21 +712,33 @@ async () => {
     r.latest_review_date = 'N/A';
     const reviewEls = document.querySelectorAll('span.rsqaWe');
     if (reviewEls.length > 0) {
-        r.latest_review_date = reviewEls[0].textContent.trim();
+        // the MOST RECENT of the loaded reviews, not the first: the overview lists them in "Most relevant" order
+        // (Farmer's Fresh, 6-Oct-2026: first = "3 years ago", newest = "a year ago")
+        const ageRe = /(\\d+|an?)\\s+(minute|hour|day|week|month|year)s?\\s+ago/i;
+        const mins = { minute: 1, hour: 60, day: 1440, week: 10080, month: 43200, year: 525600 };
+        let best = Infinity;
+        for (const el of reviewEls) {
+            const t = el.textContent.trim(), m = t.match(ageRe);
+            if (!m) continue;
+            const v = (/^an?$/i.test(m[1]) ? 1 : parseInt(m[1])) * mins[m[2].toLowerCase()];
+            if (v < best) { best = v; r.latest_review_date = t; }
+        }
+        if (r.latest_review_date === 'N/A') r.latest_review_date = reviewEls[0].textContent.trim();
     } else {
         // Fallback: look for relative time patterns in review sections
         const reviewSection = document.querySelectorAll('div.jftiEf, div.GHT2ce');
+        // date-only spans ("a year ago", "Edited 3 months ago"), the most recent -- not the first span that mentions a
+        // time ("visited a week ago" in review text); Codex review, 6-Oct-2026
+        const onlyRe = /^(edited\\s+)?(\\d+|an?)\\s+(minute|hour|day|week|month|year)s?\\s+ago$/i;
+        const mins2 = { minute: 1, hour: 60, day: 1440, week: 10080, month: 43200, year: 525600 };
+        let best2 = Infinity;
         for (const rev of reviewSection) {
-            const spans = rev.querySelectorAll('span');
-            for (const sp of spans) {
-                const t = sp.textContent.trim();
-                if (/\\d+\\s+(day|week|month|year|hour|minute)s?\\s+ago/i.test(t)
-                    || /a\\s+(day|week|month|year)\\s+ago/i.test(t)) {
-                    r.latest_review_date = t;
-                    break;
-                }
+            for (const sp of rev.querySelectorAll('span')) {
+                const t = sp.textContent.trim(), m = t.match(onlyRe);
+                if (!m) continue;
+                const v = (/^an?$/i.test(m[2]) ? 1 : parseInt(m[2])) * mins2[m[3].toLowerCase()];
+                if (v < best2) { best2 = v; r.latest_review_date = t; }
             }
-            if (r.latest_review_date !== 'N/A') break;
         }
     }
     // Final fallback: APP_INITIALIZATION_STATE — keep the most recent "X ago" string
@@ -894,11 +969,73 @@ async def extract_about(page: Page) -> str:
 
 
 
-async def extract_latest_review_date(page: Page) -> str:
+_AGE_RE = re.compile(r"(\d+|an?)\s+(minute|hour|day|week|month|year)s?\s+ago", re.I)
+_AGE_MIN = {"minute": 1, "hour": 60, "day": 1440, "week": 10080, "month": 43200, "year": 525600}
+# a span that is ONLY a review date ("a year ago", "Edited 3 months ago"), not review text that mentions one
+_AGE_ONLY_RE = re.compile(r"^(edited\s+)?(\d+|an?)\s+(minute|hour|day|week|month|year)s?\s+ago$", re.I)
+# visible review cards as [review id, date] pairs; the id tells two reviews with the same date apart
+_CARDS_JS = """() => [...document.querySelectorAll('div.jftiEf')].filter(e => e.getClientRects().length)
+    .map(e => [e.dataset.reviewId || e.getAttribute('data-review-id') || '',
+               (e.querySelector('span.rsqaWe')?.textContent || '').trim()])"""
+_NEWEST_CHECKED_JS = """() => [...document.querySelectorAll('[role="menuitemradio"]')]
+    .some(e => /Newest/i.test(e.textContent) && e.getAttribute('aria-checked') === 'true')"""
+
+
+def most_recent_age(texts) -> str:
+    """The text with the smallest "N <unit> ago" among texts ("Edited a year ago" counts), else ""."""
+    best, out = None, ""
+    for t in texts:
+        m = _AGE_RE.search(t or "")
+        if m:
+            v = (1 if m[1].lower() in ("a", "an") else int(m[1])) * _AGE_MIN[m[2].lower()]
+            if best is None or v < best:
+                best, out = v, t.strip()
+    return out
+
+
+
+async def extract_latest_review_date(page: Page, out: Optional[dict] = None,
+                                     review_count: Optional[int] = None) -> str:
+    """Up to two tries: a busy runner sometimes has the Reviews tab or the Sort menu not rendered yet, and then the
+    list stays in "Most relevant" order (A/B test, 6-Oct-2026). The second try runs only when the first could not
+    verify the Newest sort. A verified try's date is returned with `out["verified"]` True (§8.5: Newest selected and
+    cards re-rendered, or the no-Sort rule); an unverified try never feeds a verified result, so with no verified
+    try the most recent date of the tries is returned unverified."""
+    best = ""
+    verified = False
+    for attempt in (1, 2):
+        info: dict = {}
+        got = await _latest_review_date_once(page, info, review_count)
+        if info.get("verified") and got != "N/A":
+            best, verified = got, True
+            break
+        if got != "N/A":
+            best = most_recent_age([best, got]) or best
+        if info.get("verified"):
+            break   # verified order but no date: keep the unverified guess, unverified
+        logger.info("latest_review_date: not verified (attempt %d): %s", attempt, info)
+        if attempt == 1:
+            # §9.1: retry as soon as the Sort control is visible; 1.5 s stays the ceiling
+            try:
+                await page.wait_for_selector('button[aria-label*="Sort" i]', state="visible", timeout=1500)
+            except Exception:
+                pass
+    if out is not None:
+        out["verified"] = verified
+    return best or "N/A"
+
+
+async def _latest_review_date_once(page: Page, info: dict, review_count: Optional[int] = None) -> str:
     """
-    Click Reviews tab, Sort > Newest, then read first review date.
-    Default sort is 'Most relevant' — must sort by Newest to get latest.
+    One try. info gets tab (Reviews tab opened), tabs (tab labels seen, when it was not), verified (Newest sort
+    clicked or already selected).
+    Click Reviews tab, Sort > Newest (skipped when already selected), wait for the cards to re-render, then return the
+    MOST RECENT date among the loaded reviews. Default sort is 'Most relevant' -- reading only the first review there
+    stored stale dates (Farmer's Fresh, 6-Oct-2026: "3 years ago" vs newest "a year ago"). If the sort cannot be
+    verified the most recent loaded date is still the best guess, and is returned (owner, 6-Oct-2026).
     All fallback clicks use short timeouts (3s) to avoid 30s Playwright default hangs.
+    verified (§8.5) = Newest was already selected, or Newest was clicked AND the cards re-rendered. No Sort control:
+    verified when 1 <= review_count <= 10 and the distinct cards on screen >= review_count, every card date parseable.
     """
     try:
         # 0. Wait for tab buttons to render (lazy-loaded on some pages)
@@ -944,7 +1081,10 @@ async def extract_latest_review_date(page: Page) -> str:
                 clicked_reviews = True
             except Exception:
                 pass
+        info["tab"] = clicked_reviews
         if not clicked_reviews:
+            info["tabs"] = await page.eval_on_selector_all(
+                'button[role="tab"]', "els => els.map(e => e.getAttribute('aria-label') || e.textContent.trim())")
             return "N/A"
 
         # Wait for reviews content to appear
@@ -954,10 +1094,16 @@ async def extract_latest_review_date(page: Page) -> str:
                 timeout=5000,
             )
         except Exception:
-            await page.wait_for_timeout(1000)
+            # §9.1: fallback continues as soon as cards are present; 1 s stays the ceiling
+            try:
+                await page.wait_for_selector('div.jftiEf, span.rsqaWe', timeout=1000)
+            except Exception:
+                pass
+        # §8.5 "no Sort control" = no Sort button in the DOM after the wait (not "the Sort click failed")
+        no_sort = not await page.locator('button[aria-label*="Sort" i]').count()
 
         # 2. Click Sort > Newest (skip if Sort button doesn't exist — few reviews)
-        sort_clicked = False
+        sort_clicked = already = newest_clicked = rerendered = False
         sort_btn = await page.query_selector('button[aria-label*="Sort" i]')
         if sort_btn and await sort_btn.is_visible():
             await sort_btn.click()
@@ -969,19 +1115,30 @@ async def extract_latest_review_date(page: Page) -> str:
             except Exception:
                 pass
         if sort_clicked:
-            await page.wait_for_timeout(500)
+            # wait for the menu to render instead of a fixed 0.5 s: on a busy runner it took longer, every "Newest"
+            # selector missed and the list stayed in "Most relevant" order (A/B test, 6-Oct-2026)
+            try:
+                await page.wait_for_selector('[role="menuitemradio"]', state="visible", timeout=3000)
+            except PlaywrightTimeout:
+                pass
             # The Sort menu wraps the label text "Newest" inside a child div
             # (<div class="mLuXec">Newest</div>) that does NOT receive pointer
             # events — the outer <div role="menuitemradio"> does. Clicking the
             # text node fails with "intercepts pointer events". Target the
             # menuitemradio role directly.
+            # Newest already selected -> nothing to re-sort, so no wait (Codex review, 6-Oct-2026)
+            already = await page.evaluate(_NEWEST_CHECKED_JS)
+            if already:
+                await page.keyboard.press("Escape")
+            # the review cards as they are now, to tell when the Newest order has rendered
+            before = await page.evaluate(_CARDS_JS)
             newest_clicked = False
-            for sel in [
+            for sel in ([] if already else [
                 'div[role="menuitemradio"]:has-text("Newest")',
                 'li[role="menuitemradio"]:has-text("Newest")',
                 'button[role="menuitemradio"]:has-text("Newest")',
                 '[role="menuitemradio"][data-index="1"]',
-            ]:
+            ]):
                 try:
                     el = await page.query_selector(sel)
                     if el and await el.is_visible():
@@ -990,36 +1147,52 @@ async def extract_latest_review_date(page: Page) -> str:
                         break
                 except Exception:
                     continue
-            if not newest_clicked:
+            if not newest_clicked and not already:
                 try:
                     await page.get_by_role("menuitemradio", name="Newest").first.click(timeout=2000)
                     newest_clicked = True
                 except Exception:
                     pass
-            if not newest_clicked:
+            if not newest_clicked and not already:
                 try:
                     await page.get_by_text("Newest", exact=True).first.click(timeout=2000, force=True)
                     newest_clicked = True
                 except Exception:
                     pass
             if newest_clicked:
-                await page.wait_for_timeout(1500)
+                # wait until the review cards are re-rendered in Newest order (non-empty and different), instead of a
+                # fixed 1.5 s; on timeout keep the best guess below (owner, 6-Oct-2026)
+                try:
+                    await page.wait_for_function(
+                        f"b => {{ const now = ({_CARDS_JS})(); return now.length > 0 && JSON.stringify(now) !== JSON.stringify(b); }}",
+                        arg=before, timeout=5000)
+                    rerendered = True
+                except PlaywrightTimeout:
+                    pass
 
-        # 3. Extract first review date
-        review_el = await page.query_selector("span.rsqaWe")
-        if review_el:
-            return _clean(await review_el.inner_text())
-        for rev in await page.query_selector_all("div.jftiEf, div.GHT2ce"):
-            for span in await rev.query_selector_all("span"):
-                t = await span.inner_text()
-                t = (t or "").strip()
-                if re.search(
-                    r"\d+\s+(day|week|month|year|hour|minute)s?\s+ago|a\s+(day|week|month|year)\s+ago",
-                    t,
-                    re.I,
-                ):
-                    return _clean(t)
+        info["verified"] = bool(sort_clicked and (already or (newest_clicked and rerendered)))
+        if no_sort and not sort_clicked and review_count is not None and 1 <= review_count <= 10:
+            # §8.5 no-Sort rule: every review is on screen, so the max over the cards is the newest
+            cards = {(cid or date): date for cid, date in await page.evaluate(_CARDS_JS)}
+            info["no_sort_cards"] = len(cards)
+            info["verified"] = (len(cards) >= review_count
+                                and all(_AGE_ONLY_RE.match(d or "") for d in cards.values()))
+        # 3. The MOST RECENT date among the loaded reviews, not the first one. If the Newest click did not take (or the
+        # list had not re-rendered within the wait) the first review is still the "Most relevant" one -- Farmer's
+        # Fresh, 6-Oct-2026: stored "3 years ago", newest "a year ago". The min is right either way.
+        texts = [t.strip() for t in await page.eval_on_selector_all("span.rsqaWe", "els => els.map(e => e.textContent)")]
+        if not texts:
+            for rev in await page.query_selector_all("div.jftiEf, div.GHT2ce"):
+                for span in await rev.query_selector_all("span"):
+                    t = ((await span.inner_text()) or "").strip()
+                    if _AGE_ONLY_RE.match(t):
+                        texts.append(t)
+        newest = most_recent_age(texts)
+        info["dates"] = len(texts)
+        if newest:
+            return _clean(newest)
     except Exception as e:
+        info["error"] = f"{type(e).__name__}: {str(e)[:120]}"
         logger.debug("extract_latest_review_date: %s", e)
     return "N/A"
 
@@ -1045,12 +1218,65 @@ async def extract_amenities(page: Page) -> str:
     return "N/A"
 
 
+def _iso(dt: Optional[datetime]) -> Optional[str]:
+    """UTC ISO with milliseconds and 'Z' (TRY_CAST(... AS datetime2(3)) accepts it)."""
+    if dt is None:
+        return None
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+_NO_REVIEWS_JS = r"() => /\bNo reviews\b/i.test(document.querySelector('div[role=\"main\"]')?.innerText || '')"
+
+
+async def _apply_normalised(page: Page, place: PlaceData, observed: datetime, review_info: dict) -> None:
+    """§8.7: add the normalised keys; the raw fields stay untouched."""
+    place.observed_at = _iso(observed)
+    place.phone_e164 = nz.normalise_phone(place.phone, os.environ.get("PHASE2_COUNTRY_CODE", "91"))
+    place.website_host = nz.website_host(place.website)
+    place.rating_num = nz.parse_rating(place.rating)
+    # the JS/fallback default is '0' even when no count text exists: 0 only from a shown "No reviews" (§8.7)
+    rc = nz.parse_review_count(place.review_count)
+    if rc == 0:
+        try:
+            rc = 0 if await page.evaluate(_NO_REVIEWS_JS) else None
+        except Exception:
+            rc = None
+    place.review_count_int = rc
+    price = nz.parse_price(place.price_level)
+    if price:
+        place.price_currency, place.price_min, place.price_max = price
+    addr = nz.parse_address(place.address)
+    if addr:
+        place.address_postcode, place.address_state = addr
+    place.category_class = nz.category_class(place.category)
+    if place.category_class == "other":
+        logger.info("category_class: unmapped raw category %r", place.category)
+    if nz.null_if_sentinel(place.latest_review_date) is not None:
+        at_min, at_max, gran = nz.review_interval(place.latest_review_date, observed)
+        verified = bool(review_info.get("verified"))
+        place.latest_review_at_min, place.latest_review_at_max = _iso(at_min), _iso(at_max)
+        # §8.5: bit 0 -> 'unverified'; verified but unparseable text -> NULL
+        place.latest_review_granularity = (None if gran == "unknown" else gran) if verified else "unverified"
+        place.latest_review_verified = int(verified)
+
+
 async def extract_all(page: Page, url: str, config=None, place_id: Optional[str] = None, lean: bool = False, lean_enrich: bool = False, photo_urls: bool = False) -> PlaceData:
+    """Extract all attributes (`_extract_all_raw`), then add observed_at and the normalised keys (§8.5, §8.7)."""
+    observed = datetime.now(timezone.utc)   # extract_all runs right after the page load
+    review_info: dict = {}
+    place = await _extract_all_raw(page, url, config, place_id, lean, lean_enrich, photo_urls, review_info)
+    await _apply_normalised(page, place, observed, review_info)
+    return place
+
+
+async def _extract_all_raw(page: Page, url: str, config=None, place_id: Optional[str] = None, lean: bool = False,
+                           lean_enrich: bool = False, photo_urls: bool = False,
+                           review_info: Optional[dict] = None) -> PlaceData:
     """
     Orchestrator: extract all attributes from the current place page.
 
-    For closed places (Temporarily/Permanently closed): only extracts name, place_id, status
-    to speed up long scrapes. Full extraction for open places.
+    For closed places (Temporarily/Permanently closed): the full field pass, coords, hours and share still run
+    (§8.7 R3-13); only the photo carousel and Reviews -> Newest are skipped.
 
     lean=True: skip hours, about, amenities, share link (saves ~15ms/place).
     lean_enrich=True: extract rating, review_count, photo_count via JS + latest_review_date
@@ -1085,17 +1311,9 @@ async def extract_all(page: Page, url: str, config=None, place_id: Optional[str]
         except Exception:
             pass
 
-    if _is_closed(place.status):
-        logger.debug("Skipping full extraction for closed place: %s", place.name)
-        # Still extract lat/long for closed places (useful for mapping)
-        try:
-            coords = await page.evaluate(LATLONG_JS)
-            if coords.get("latitude"):
-                place.latitude = float(coords["latitude"])
-                place.longitude = float(coords["longitude"])
-        except Exception:
-            pass
-        return place
+    closed_status = place.status if _is_closed(place.status) else None
+    if closed_status:
+        logger.debug("Closed place, skipping photos and Reviews: %s", place.name)
 
     # ── Phase 1: JS injection for static DOM reads ──
     if lean_enrich:
@@ -1117,7 +1335,7 @@ async def extract_all(page: Page, url: str, config=None, place_id: Optional[str]
         place.phone = _clean(data.get("phone", "N/A"))
 
         # Photo count (user-uploaded): scroll carousel, wait for images, count URLs
-        if photo_urls:
+        if photo_urls and not closed_status:
             try:
                 await page.evaluate("""
                     () => {
@@ -1218,6 +1436,10 @@ async def extract_all(page: Page, url: str, config=None, place_id: Optional[str]
         place.menu_link = data.get("menu_link", "N/A")
         place.latest_review_date = _clean(data.get("latest_review_date", "N/A"))
 
+    # a field pass that reads "Open" must not undo the closed status detected above
+    if closed_status and not _is_closed(place.status):
+        place.status = closed_status
+
     # ── Phase 3: Python regex fallback for review count ──
     if place.review_count == "0":
         place.review_count = await _fallback_review_count(page)
@@ -1231,12 +1453,12 @@ async def extract_all(page: Page, url: str, config=None, place_id: Optional[str]
     # the Reviews tab and explicitly Sort > Newest when reviews exist —
     # overwriting whatever EXTRACT_JS read.
     try:
-        rc = int(place.review_count or "0")
+        rc = int(str(place.review_count or "0").replace(",", ""))
     except (TypeError, ValueError):
         rc = 0
-    if rc > 0:
+    if rc > 0 and not closed_status:
         try:
-            newest_date = await extract_latest_review_date(page)
+            newest_date = await extract_latest_review_date(page, review_info, rc)
             if newest_date and newest_date != "N/A":
                 place.latest_review_date = newest_date
         except Exception:

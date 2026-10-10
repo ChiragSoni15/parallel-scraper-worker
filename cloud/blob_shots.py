@@ -24,6 +24,8 @@ directly in a browser tab or an <img> tag (no download prompt).
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import logging
 import os
 import time
@@ -90,6 +92,11 @@ def photo_name(run_id: str, place_id: str, seq: int, ext: str) -> str:
     return f"{run_id}/{place_id}/{place_id}_{seq}.{ext}"
 
 
+def photo_blob_name(place_id: str, sha1: str) -> str:
+    """Content-addressed master: photos/<pid>/<sha1(source bytes)[:20]>.jpg (§4.1)."""
+    return f"photos/{place_id}/{sha1[:20]}.jpg"
+
+
 def _put_blob(name: str, body: bytes, content_type: str, meta: dict,
               sas_url: str | None = None, session=None,
               skip_existing: bool = False) -> bool:
@@ -124,8 +131,11 @@ def _put_blob(name: str, body: bytes, content_type: str, meta: dict,
             resp = http.put(url, data=body, headers=headers, timeout=_PUT_TIMEOUT_S)
             if resp.status_code == 201:
                 return True
-            if skip_existing and resp.status_code in (409, 412):
-                return False                      # BlobAlreadyExists: idempotent skip
+            # Only a real "already there" is a skip; any other 409 is a failure (§4.1).
+            if skip_existing and (resp.status_code == 412 or (
+                    resp.status_code == 409 and (getattr(resp, "headers", None) or {})
+                    .get("x-ms-error-code") == "BlobAlreadyExists")):
+                return False
             # 403 = SAS expired/wrong perms: retrying won't help.
             if resp.status_code == 403:
                 raise RuntimeError(f"blob PUT forbidden (SAS expired or missing cw perms): {resp.status_code}")
@@ -231,3 +241,74 @@ def upload_place_photos(run_id: str, place_id: str, image_urls,
     if stored < len(urls):
         logger.info("photos_partial pid=%s stored=%d of %d", place_id, stored, len(urls))
     return stored
+
+
+_MASTER_SIDE = 1600
+_MASTER_QUALITY = 85
+
+
+def resize_master(src: bytes) -> tuple[bytes, int, int]:
+    """Longest side 1600 px, JPEG q85. Returns (jpeg_bytes, width, height)."""
+    from PIL import Image  # lazy: the worker imports this module without Pillow
+    img = Image.open(io.BytesIO(src)).convert("RGB")
+    img.thumbnail((_MASTER_SIDE, _MASTER_SIDE))
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=_MASTER_QUALITY)
+    return out.getvalue(), img.width, img.height
+
+
+def _source_url(item) -> str:
+    """CDN rewrite to =s1600; Street View thumbs are fetched as given."""
+    if item.source == "street_view":
+        return item.url
+    return item.url.split("=")[0] + "=s1600"
+
+
+def mirror_selected(run_id: str, place_id: str, selected, *, fetch=None, put=None,
+                    resize=None, pool_workers: int = _PHOTO_POOL_WORKERS) -> list[dict]:
+    """Mirror selected photos (gallery_select.Selected, plus the Street View item)
+    to ``photos/<pid>/<sha1>.jpg``; one outcome per item, in input order (§4.1):
+    {ordinal, blob_name, sha1, width, height, bytes, status}, ordinal = selection
+    index, status written | exists | failed.
+
+    Injected for tests: fetch(url) -> bytes | None; put(name, body, meta) ->
+    'written' | 'exists' (raise on failure); resize(bytes) -> (bytes, w, h).
+    """
+    if fetch is None:
+        def fetch(url):
+            r = requests.get(url, timeout=_PHOTO_GET_TIMEOUT_S)
+            return r.content if r.status_code == 200 and r.content else None
+    if put is None:
+        def put(name, body, meta):
+            return "written" if _put_blob(name, body, "image/jpeg", meta,
+                                          skip_existing=True) else "exists"
+    resize = resize or resize_master
+
+    def one(args) -> dict:
+        i, item = args
+        out = {"ordinal": i, "blob_name": None, "sha1": None, "width": None,
+               "height": None, "bytes": None, "status": "failed"}
+        try:
+            src = fetch(_source_url(item))
+            if not src:
+                return out
+            sha1 = hashlib.sha1(src).hexdigest()[:20]
+            body, w, h = resize(src)
+            name = photo_blob_name(place_id, sha1)
+            out.update(sha1=sha1, width=w, height=h, bytes=len(body))
+            meta = {"runid": run_id, "placeid": place_id, "source": item.source,
+                    "googleurl": (item.url or "").encode("ascii", "ignore").decode()[:2000],
+                    "dhash": f"{item.dhash:016x}" if item.dhash is not None else "",
+                    "photodate": item.photo_month or ""}
+            status = put(name, body, meta)
+            if status in ("written", "exists"):
+                out.update(status=status, blob_name=name)
+        except Exception:
+            logger.debug("photo_mirror_failed pid=%s ordinal=%d", place_id, i, exc_info=True)
+        return out
+
+    items = list(enumerate(selected))
+    if not items:
+        return []
+    with ThreadPoolExecutor(max_workers=max(1, min(pool_workers, len(items)))) as ex:
+        return list(ex.map(one, items))

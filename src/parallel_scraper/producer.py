@@ -12,8 +12,11 @@ from typing import Optional
 from parallel_scraper.boundary import (
     GridCell,
     boundary_from_polygon,
+    cell_id_root_and_path,
+    derive_cell,
     fetch_boundary,
     generate_grid,
+    split_cell,
 )
 from parallel_scraper.config import ParallelConfig
 from parallel_scraper.dedup import DedupCache
@@ -116,6 +119,35 @@ class QueueRefiller(threading.Thread):
             logger.info("refiller.stop fed_total=%d", self.fed_total)
 
 
+def resume_child_tasks(
+    state_rows: list[dict],
+    roots_by_id: dict[str, GridCell],
+    done_keys: set[tuple[str, str]],
+) -> list[tuple[GridCell, str]]:
+    """Rebuild adaptive-grid child tasks left unfinished by a prior run.
+
+    Child cells only exist in state_cells.csv (registered as 'pending' at
+    subdivision time) — never in the generated root grid. Their geometry is
+    derivable from the root cell + the quadrant path encoded in the id
+    ("MAH_0012q3q1"), so nothing beyond the id needs persisting."""
+    out: list[tuple[GridCell, str]] = []
+    for row in state_rows:
+        if row.get("status") == "done":
+            continue
+        cid = row.get("cell_id") or ""
+        q = row.get("query") or ""
+        root_id, path = cell_id_root_and_path(cid)
+        if not path:
+            continue  # root cells are already in the grid work list
+        root = roots_by_id.get(root_id)
+        if root is None:
+            continue  # stale row from a different grid config
+        if (cid, q) in done_keys:
+            continue
+        out.append((derive_cell(root, path), q))
+    return out
+
+
 class Producer(threading.Thread):
     """Phase-1 producer thread. Owns one persistent Playwright Chromium for the run."""
 
@@ -142,6 +174,10 @@ class Producer(threading.Thread):
         self._run_id = run_id
         self._discovered_writer = discovered_writer
         self._error: Optional[BaseException] = None
+        # Adaptive-grid child tasks spawned by saturated cells (thread-safe
+        # deque; workers append, the dispatch loop pops). None when disabled.
+        self._child_tasks: Optional[deque] = None
+        self._adaptive_added = 0  # spawned-children counter (logging only)
 
     @property
     def error(self) -> Optional[BaseException]:
@@ -355,6 +391,22 @@ class Producer(threading.Thread):
             for q in queries
             if (cell.cell_id, q) not in done_keys
         )
+
+        # Adaptive grid: recover child cells a previous run subdivided but
+        # didn't finish, and arm the live child-task deque.
+        resumed_children: list[tuple[GridCell, str]] = []
+        if self._adaptive_enabled():
+            self._child_tasks = deque()
+            roots_by_id = {c.cell_id: c for c in cells}
+            resumed_children = resume_child_tasks(
+                self._state.cells_all(), roots_by_id, done_keys)
+            for task in resumed_children:
+                self._child_tasks.append(task)
+            total_tasks += len(resumed_children)
+            if resumed_children:
+                self._stats.add_phase1_cells(len(resumed_children))
+                logger.info("producer.adaptive_resume children=%d", len(resumed_children))
+
         if not total_tasks:
             logger.info("producer.no_work all cells already done")
             return
@@ -405,7 +457,7 @@ class Producer(threading.Thread):
             rate_1m = len(completion_times) / rate_window_s
             key_status = key_manager.get_key_status()
             cooling_keys = sum(1 for k in key_status if k.get("cooling_down"))
-            remaining = max(0, total_tasks - completion_count)
+            remaining = max(0, total_tasks + self._adaptive_added - completion_count)
             eta_s = remaining / rate_1m if rate_1m > 0 else 0
             logger.info(
                 "producer.places_api_batch done=%d failed=%d partial=%d elapsed_s=%.1f "
@@ -459,10 +511,19 @@ class Producer(threading.Thread):
                 def _submit_next() -> bool:
                     if self._stop.is_set() or self._max_places_reached():
                         return False
-                    try:
-                        task = next(task_iter)
-                    except StopIteration:
-                        return False
+                    # Adaptive children first (deque is thread-safe), then the
+                    # root-grid iterator.
+                    task = None
+                    if self._child_tasks is not None:
+                        try:
+                            task = self._child_tasks.popleft()
+                        except IndexError:
+                            task = None
+                    if task is None:
+                        try:
+                            task = next(task_iter)
+                        except StopIteration:
+                            return False
                     pending.add(ex.submit(_do_one, task))
                     return True
 
@@ -503,12 +564,16 @@ class Producer(threading.Thread):
                                 f"All {key_manager.key_count} Places API keys are unusable "
                                 f"(auth-disabled or daily-exhausted) after {completion_count} cells"
                             )
-                        _submit_next()
                     if self._stop.is_set() or self._max_places_reached():
                         for f in pending:
                             f.cancel()
                         pending.clear()
                         break
+                    # Top up to the window. One submit per completion isn't
+                    # enough with adaptive subdivision — a saturated cell adds
+                    # 4 children, so the backlog can grow past 1:1.
+                    while len(pending) < window and _submit_next():
+                        pass
                     # fut.result() — exceptions already logged in _do_one
         finally:
             # Final flush so the billing-day ledger captures every call.
@@ -537,6 +602,13 @@ class Producer(threading.Thread):
         self._stats.worker_set(wid, phase=1, state="busy",
                                task=f"cell {cell.cell_id}", query=q)
         t0 = time.monotonic()
+        # Actual cell edge: root cells are coarse in adaptive mode; children
+        # halve per split level (level = quadrant-path length in the id).
+        if self._adaptive_enabled():
+            _, quad_path = cell_id_root_and_path(cell.cell_id)
+            edge_m = max(1, int(self._config.adaptive_coarse_meters / (2 ** len(quad_path))))
+        else:
+            edge_m = self._config.grid_size_meters
         try:
             bbox = None
             if self._config.places_use_location_restriction:
@@ -550,7 +622,7 @@ class Producer(threading.Thread):
                 cell.centroid_lat,
                 cell.centroid_lon,
                 cell.cell_id,
-                self._config.grid_size_meters,
+                edge_m,
                 self._config.places_tier,
                 self._config.places_language_code,
                 self._config.places_region_code,
@@ -619,6 +691,21 @@ class Producer(threading.Thread):
             # (real coverage) — keep these as done.
             status_for_stats = "partial" if fail_code is not None else "done"
             error_msg = "" if fail_code is None else f"Partial Places API result: HTTP {fail_code}"
+
+            # Adaptive quadtree: a saturated cell (unique results at the Text
+            # Search truncation ceiling) is hiding outlets — split it into 4
+            # quadrant children, down to grid_size_meters as the floor.
+            # Children are registered as durable 'pending' state rows BEFORE
+            # the parent flips to 'done', so a crash between the two re-runs
+            # the parent (idempotent) instead of losing the children.
+            children: list[GridCell] = []
+            if (self._child_tasks is not None
+                    and len(discovered) >= self._config.adaptive_saturation_threshold
+                    and edge_m / 2 >= self._config.grid_size_meters):
+                children = split_cell(cell)
+                for ch in children:
+                    self._state.cells_add_pending(ch.cell_id, q)
+
             logger.debug(
                 "producer.places_api_cell_done cell=%s query=%s worker=%d found=%d new=%d api_pages=%d status=%s elapsed=%.1fs",
                 cell.cell_id, q, worker_id, len(pids), len(survivors), ok_count,
@@ -627,6 +714,16 @@ class Producer(threading.Thread):
             self._state.cells_set(cell.cell_id, q, status="done",
                                   place_count=len(survivors),
                                   error_msg=error_msg)
+
+            if children:
+                for ch in children:
+                    self._child_tasks.append((ch, q))
+                self._adaptive_added += len(children)
+                self._stats.add_phase1_cells(len(children))
+                logger.info(
+                    "producer.adaptive_split cell=%s query=%s unique=%d edge_m=%d -> 4 children @%dm",
+                    cell.cell_id, q, len(discovered), edge_m, edge_m // 2,
+                )
         self._stats.worker_set(wid, phase=1, state="idle", task="—", query="")
 
         self._stats.record_cell_result(status_for_stats)
@@ -721,9 +818,20 @@ class Producer(threading.Thread):
             boundary = boundary_from_polygon(self._config.boundary_polygon)
         else:
             boundary = fetch_boundary(self._config.osm_relation_id, self._config.osm_type)
+        # Adaptive (quadtree) mode: the generated grid is the COARSE root grid;
+        # saturated cells subdivide at run time down to grid_size_meters.
+        size = self._config.grid_size_meters
+        if self._adaptive_enabled():
+            size = max(size, self._config.adaptive_coarse_meters)
         cells = generate_grid(
-            boundary, self._config.grid_size_meters,
+            boundary, size,
             city_prefix=self._config.city_name[:3].upper(),
             grid_type=self._config.grid_type,
         )
         return cells
+
+    def _adaptive_enabled(self) -> bool:
+        # Quadtree subdivision is implemented for the Places API path only.
+        return (self._config.adaptive_grid
+                and self._config.discovery_backend == "places_api"
+                and not self._config.dry_run)

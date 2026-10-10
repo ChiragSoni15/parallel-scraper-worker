@@ -5,7 +5,7 @@
   const $$ = (s, root = document) => Array.from(root.querySelectorAll(s));
 
   const TILE_URL = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
-  const TILE_DARK_URL = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
+  const TILE_DARK_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}";
 
   const state = {
     // routing
@@ -549,8 +549,8 @@
     const map = L.map("monitor-map", { zoomControl: true, attributionControl: true })
       .setView([20.5937, 78.9629], 5);
     L.tileLayer(TILE_DARK_URL, {
-      maxZoom: 19, subdomains: "abcd", r: "@2x",
-      attribution: "© OpenStreetMap, © CARTO",
+      maxZoom: 19, maxNativeZoom: 16,
+      attribution: "© Esri, © OpenStreetMap",
     }).addTo(map);
     state.monitorMap = map;
     setTimeout(() => map.invalidateSize(), 200);

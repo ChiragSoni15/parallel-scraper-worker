@@ -160,11 +160,22 @@ async function generateGrid({ osm_id, osm_type, custom_polygon, area_name, grid_
 //                  fetch the full grid. Instead poll ?mode=touched on a
 //                  modest cadence (every ~6 s) so only the touched-cell
 //                  subset comes over the wire. Map renders only those.
+// Per-run cache of the heavy, slow-changing payloads (boundary, grid,
+// touched cells + etag). Switching workspace tabs remounts LiveRun, which
+// used to re-download and re-parse several MB per switch; now the cached
+// copy renders immediately and only a conditional refresh goes out.
+const RUN_CACHE = new Map();
+function runCache(runId) {
+  let c = RUN_CACHE.get(runId);
+  if (!c) { c = { boundary: null, grid: null, touched: null, etag: null, mode: null }; RUN_CACHE.set(runId, c); }
+  return c;
+}
+
 function useRunStream(runId) {
   const [snap, setSnap] = useStateD(null);
-  const [grid, setGrid] = useStateD(null);
-  const [boundary, setBoundary] = useStateD(null);
-  const [cellStates, setCellStates] = useStateD([]);
+  const [grid, setGrid] = useStateD(() => (runId && runCache(runId).grid) || null);
+  const [boundary, setBoundary] = useStateD(() => (runId && runCache(runId).boundary) || null);
+  const [cellStates, setCellStates] = useStateD(() => (runId && runCache(runId).touched) || []);
   const [liveLogs, setLiveLogs] = useStateD([]);
   const esRef = useRefD(null);
   const liveLogsRef = useRefD([]);
@@ -175,37 +186,54 @@ function useRunStream(runId) {
       return;
     }
     let cancelled = false;
-    let mode = "full";              // optimistic; revised after first snap
+    const cache = runCache(runId);
+    let mode = cache.mode || "full";   // optimistic; revised after first snap
     let touchedTimer = null;
     let fetchedInitialGrid = false;
+    let active = true;                 // flipped by snapshots; stops polling once the run ends
     liveLogsRef.current = [];
     setLiveLogs([]);
+    setGrid(cache.grid); setBoundary(cache.boundary); setCellStates(cache.touched || []);
 
     // Boundary is small (a single polygon — typically <1 MB even for MMR)
-    // and never changes during a run, so fetch once.
-    api(`/api/runs/${encodeURIComponent(runId)}/boundary`)
-      .then(b => { if (!cancelled) setBoundary(b); })
-      .catch(() => {});
+    // and never changes during a run, so fetch once per page load.
+    if (!cache.boundary) {
+      api(`/api/runs/${encodeURIComponent(runId)}/boundary`)
+        .then(b => { cache.boundary = b; if (!cancelled) setBoundary(b); })
+        .catch(() => {});
+    }
 
     function fetchGrid(modeArg) {
-      api(`/api/runs/${encodeURIComponent(runId)}/grid?mode=${modeArg}`)
-        .then(g => {
+      if (modeArg === "full") {
+        if (cache.grid && !cache.grid._touchedOnly) return;
+        api(`/api/runs/${encodeURIComponent(runId)}/grid?mode=full`)
+          .then(g => { cache.grid = g; if (!cancelled) setGrid(g); })
+          .catch(() => {});
+        return;
+      }
+      // touched: conditional GET — the server answers 304 when state_cells.csv
+      // is unchanged, so an idle poll costs a few bytes instead of ~7 MB.
+      fetch(`/api/runs/${encodeURIComponent(runId)}/grid?mode=touched`,
+            { headers: cache.etag ? { "if-none-match": cache.etag } : {} })
+        .then(async res => {
+          if (res.status === 304 || !res.ok) return;
+          const g = await res.json();
+          cache.etag = res.headers.get("etag");
+          cache.touched = cellStatesFromGrid(g);
+          if (mode === "touched") { g._touchedOnly = true; cache.grid = g; }
           if (cancelled) return;
-          if (modeArg === "touched") {
-            setCellStates(cellStatesFromGrid(g));
-            if (mode === "touched") setGrid(g);
-          } else {
-            setGrid(g);
-          }
+          setCellStates(cache.touched);
+          if (mode === "touched") setGrid(g);
         })
         .catch(() => {});
     }
 
     function startTouchedPolling() {
       if (touchedTimer) return;
-      // 6s cadence keeps the heatmap fresh; the server caches by CSV mtime.
+      // 6s cadence keeps the heatmap fresh while the run is active; a finished
+      // run's state file never changes, so polling it is pure waste.
       touchedTimer = setInterval(() => {
-        if (cancelled) return;
+        if (cancelled || !active) return;
         fetchGrid("touched");
       }, 6000);
     }
@@ -226,9 +254,9 @@ function useRunStream(runId) {
         } catch {}
       }
       const huge = totalCells > 5000;
-      mode = huge ? "touched" : "full";
-      fetchGrid(mode);
-      fetchGrid("touched");
+      mode = cache.mode = huge ? "touched" : "full";
+      if (mode === "full") fetchGrid("full");
+      fetchGrid("touched");           // one call — it also carries the cell states
       fetchedInitialGrid = true;
       startTouchedPolling();
     }
@@ -236,8 +264,9 @@ function useRunStream(runId) {
     // bootstrap with summary; defer grid fetch until we know the size.
     api(`/api/runs/${encodeURIComponent(runId)}`).then(s => {
       if (cancelled) return;
+      active = !!s.active;
       setSnap(s);
-      chooseGridModeAndFetch(s);
+      if (!fetchedInitialGrid) chooseGridModeAndFetch(s);
     }).catch(() => {});
 
     // SSE: initial snapshot, then heartbeat deltas only.
@@ -246,6 +275,7 @@ function useRunStream(runId) {
     const onSnap = (ev) => {
       try {
         const s = JSON.parse(ev.data);
+        if ("active" in s) active = !!s.active;
         if (!cancelled) setSnap((prev) => ({ ...(prev || {}), ...s }));
         // Lazy first fetch if the summary call hasn't come back yet.
         if (!fetchedInitialGrid) {
@@ -262,6 +292,7 @@ function useRunStream(runId) {
           if (!cancelled) setLiveLogs(rows.slice());
         }
         const { log_events, ...rest } = h;
+        if ("active" in rest) active = !!rest.active;
         if (!cancelled) setSnap((prev) => ({ ...(prev || {}), ...rest }));
       } catch {}
     };
@@ -373,6 +404,27 @@ function workersFromSnapshot(snap) {
   return { p1: p1.map(norm), p2: p2.map(norm) };
 }
 
+// ── run queue ───────────────────────────────────────────────────────
+function useQueue(refreshMs = 5000) {
+  const [items, setItems] = useStateD([]);
+  const refresh = useCallbackD(async () => {
+    try { const d = await api("/api/queue"); setItems(d.items || []); }
+    catch { /* silent */ }
+  }, []);
+  useEffectD(() => {
+    refresh();
+    const t = setInterval(refresh, refreshMs);
+    return () => clearInterval(t);
+  }, [refresh, refreshMs]);
+  return { items, refresh };
+}
+async function queueAdd(body) {
+  return api("/api/queue", { method: "POST", body: JSON.stringify(body) });
+}
+async function queueRemove(id) {
+  return api(`/api/queue/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
 // run actions
 async function startRun(body) {
   return api("/api/runs", { method: "POST", body: JSON.stringify(body) });
@@ -417,6 +469,9 @@ window.useRunBoundary = useRunBoundary;
 window.useStats = useStats;
 window.useApiKeys = useApiKeys;
 window.workersFromSnapshot = workersFromSnapshot;
+window.useQueue = useQueue;
+window.queueAdd = queueAdd;
+window.queueRemove = queueRemove;
 window.startRun = startRun;
 window.stopRun = stopRun;
 window.savePreset = savePreset;

@@ -1,0 +1,55 @@
+name: kw-photo-thumbs
+
+# Kwality: copy each list outlet's storefront close-up from the private Azure container into the public Supabase
+# bucket kwality-photos as a 480px thumbnail (tools/kw_photo_thumbs.py). The work list is public.kw_photo_job_list;
+# each matrix job takes one seq slice and marks its rows done/error, so a re-run only redoes what is left.
+# Manual dispatch only.
+on:
+  workflow_dispatch:
+    inputs:
+      total:        { required: true,  type: string, description: "highest seq in kw_photo_job_list" }
+      slices:       { required: false, type: string, default: "8" }
+      workers:      { required: false, type: string, default: "16" }
+      retry_errors: { required: false, type: string, default: "false" }
+
+concurrency:
+  group: kw-photo-thumbs
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        env:
+          TOTAL: ${{ inputs.total }}
+          SLICES: ${{ inputs.slices }}
+        run: |
+          python3 -c 'import json,os,math; t=int(os.environ["TOTAL"]); n=int(os.environ["SLICES"]); w=math.ceil(t/n); print("matrix="+json.dumps([{"from":i*w,"to":min(t,(i+1)*w)} for i in range(n)]))' >> "$GITHUB_OUTPUT"
+
+  copy:
+    needs: plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet requests pillow
+      - name: Copy this slice's photos
+        env:
+          SUPABASE_DEDUP_URL: ${{ secrets.SUPABASE_DEDUP_URL }}
+          SUPABASE_DEDUP_SERVICE_KEY: ${{ secrets.SUPABASE_DEDUP_SERVICE_KEY }}
+          AZURE_MEDIA_CONTAINER_URL: https://micromarket.blob.core.windows.net/scraper-media
+          AZURE_STORAGE_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+        run: |
+          python tools/kw_photo_thumbs.py --workers "${{ inputs.workers }}" \
+            --seq-from "${{ matrix.slice.from }}" --seq-to "${{ matrix.slice.to }}" \
+            $([ "${{ inputs.retry_errors }}" = "true" ] && echo --retry-errors)

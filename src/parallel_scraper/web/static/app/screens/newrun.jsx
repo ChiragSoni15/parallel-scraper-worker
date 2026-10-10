@@ -29,6 +29,8 @@ const NewRun = ({ setRoute, mapStyle }) => {
   // grid config
   const [gridSize, setGridSize] = useStateNR(1000);
   const [gridShape, setGridShape] = useStateNR("square");
+  const [adaptiveGrid, setAdaptiveGrid] = useStateNR(false);
+  const [adaptiveCoarse, setAdaptiveCoarse] = useStateNR(4000);
 
   // resolved area + grid GeoJSON
   const [areaResolved, setAreaResolved] = useStateNR(null);  // { name, total_cells, source, osm_id, osm_type, custom_polygon }
@@ -36,6 +38,9 @@ const NewRun = ({ setRoute, mapStyle }) => {
   const [gridGJ, setGridGJ] = useStateNR(null);
   const [gridLoading, setGridLoading] = useStateNR(false);
   const [gridError, setGridError] = useStateNR(null);
+  // True when the server sent a decimated grid preview (huge grids only —
+  // total_cells stays exact; the real run regenerates the full grid).
+  const [gridSampled, setGridSampled] = useStateNR(false);
 
   // stage 2 — queries
   const seededRef = useRefNR(false);
@@ -64,6 +69,8 @@ const NewRun = ({ setRoute, mapStyle }) => {
   const [captureShots, setCaptureShots] = useStateNR(false);
   const [phase1Only, setPhase1Only] = useStateNR(false);
   const [starting, setStarting] = useStateNR(false);
+  const [queueing, setQueueing] = useStateNR(false);
+  const { items: queueItems, refresh: refreshQueue } = window.useQueue();
   // Custom run name. Empty -> server generates par_YYYYMMDD_HHMMSS_xxxxxx.
   // Otherwise user-supplied; sanitized to filesystem-safe chars on send.
   const [customName, setCustomName] = useStateNR("");
@@ -163,6 +170,7 @@ const NewRun = ({ setRoute, mapStyle }) => {
         : { osm_id: c.osm_id, osm_type: c.osm_type, area_name: c.name, grid_size_meters: gridSize, grid_type: gridShape };
       const g = await window.generateGrid(gridRequest);
       setBoundaryGJ(g.boundary_geojson); setGridGJ(g.grid_geojson);
+      setGridSampled(!!g.grid_preview_sampled);
       if ((g.total_cells || 0) <= 0) {
         setAreaResolved(null);
         setGridError("Selected area produced 0 grid cells. Choose a boundary result, use an OSM relation/way, or draw a larger area.");
@@ -184,6 +192,7 @@ const NewRun = ({ setRoute, mapStyle }) => {
       const g = await window.generateGrid({ osm_id: id, osm_type: osmType, area_name: "",
                                             grid_size_meters: gridSize, grid_type: gridShape });
       setBoundaryGJ(g.boundary_geojson); setGridGJ(g.grid_geojson);
+      setGridSampled(!!g.grid_preview_sampled);
       if ((g.total_cells || 0) <= 0) {
         setAreaResolved(null);
         setGridError("Selected OSM object produced 0 grid cells. Use a relation/way boundary or draw a larger area.");
@@ -238,6 +247,7 @@ const NewRun = ({ setRoute, mapStyle }) => {
       const g = await window.generateGrid({ custom_polygon: coords, area_name: name,
                                             grid_size_meters: gridSize, grid_type: gridShape });
       setBoundaryGJ(g.boundary_geojson); setGridGJ(g.grid_geojson);
+      setGridSampled(!!g.grid_preview_sampled);
       if ((g.total_cells || 0) <= 0) {
         setAreaResolved(null);
         setGridError("Selected polygon produced 0 grid cells. Draw a larger area or reduce grid size.");
@@ -293,23 +303,26 @@ const NewRun = ({ setRoute, mapStyle }) => {
   }
   const sanitizedName = sanitizeRunName(customName);
 
-  async function doStartRun() {
-    if (!areaResolved) return;
+  // Build the StartRunBody from current form state. Returns null (after an
+  // alert) when validation fails. Shared by "start run" and "add to queue".
+  function buildRunBody() {
+    if (!areaResolved) return null;
     if (cells <= 0) {
       alert("Pick an area that creates at least one grid cell.");
-      return;
+      return null;
     }
     if (validQueries.length === 0) {
       alert("Add at least one search query.");
-      return;
+      return null;
     }
-    const queriesStr = validQueries.join(",");
     const body = {
       osm_id: areaResolved.osm_id || 0,
       osm_type: areaResolved.osm_type || "relation",
       city: areaResolved.name || "area",
       grid_size_meters: gridSize,
-      queries: queriesStr,
+      adaptive_grid: adaptiveGrid,
+      adaptive_coarse_meters: adaptiveCoarse,
+      queries: validQueries.join(","),
       phase1_workers: workers1,
       phase2_workers: phase1Only ? 0 : workers2,
       worker_browser_recycle_after: recycleAfter,
@@ -321,7 +334,7 @@ const NewRun = ({ setRoute, mapStyle }) => {
       body.run_id = sanitizedName;
     }
     if (columnsProfile === "custom") {
-      if (!customCols.length) { alert("Pick at least one column."); setStarting(false); return; }
+      if (!customCols.length) { alert("Pick at least one column."); return null; }
       body.columns = [...customCols];
     } else {
       body.profile = columnsProfile === "standard" ? "default"
@@ -333,6 +346,12 @@ const NewRun = ({ setRoute, mapStyle }) => {
     if (areaResolved.source === "polygon" || areaResolved.source === "bbox") {
       body.custom_polygon = areaResolved.custom_polygon;
     }
+    return body;
+  }
+
+  async function doStartRun() {
+    const body = buildRunBody();
+    if (!body) return;
     setStarting(true);
     try {
       const r = await window.startRun(body);
@@ -340,6 +359,26 @@ const NewRun = ({ setRoute, mapStyle }) => {
     } catch (e) {
       alert(`failed to start run: ${e.message}`);
     } finally { setStarting(false); }
+  }
+
+  async function doQueueAdd() {
+    const body = buildRunBody();
+    if (!body) return;
+    setQueueing(true);
+    try {
+      await window.queueAdd(body);
+      refreshQueue();
+      // Bounce back to stage 1 so the next boundary can be picked right away.
+      setStage(1);
+      setCustomName("");
+    } catch (e) {
+      alert(`failed to queue: ${e.message}`);
+    } finally { setQueueing(false); }
+  }
+
+  async function doQueueRemove(id) {
+    try { await window.queueRemove(id); refreshQueue(); }
+    catch (e) { alert(`failed to remove: ${e.message}`); }
   }
 
   async function doSavePreset() {
@@ -486,6 +525,30 @@ const NewRun = ({ setRoute, mapStyle }) => {
                   <span className="muted" style={{fontSize:11}}>m</span>
                 </div>
                 <p className="help">smaller cells = more API calls but better completeness near dense urban cores.</p>
+              </div>
+
+              <div className="field">
+                <label className="check">
+                  <input type="checkbox" checked={adaptiveGrid} onChange={e=>setAdaptiveGrid(e.target.checked)}/>
+                  adaptive grid · quadtree — start coarse, split saturated cells
+                </label>
+                {adaptiveGrid && (
+                  <div className="field-row" style={{marginTop:6, alignItems:"center"}}>
+                    <span className="muted" style={{fontSize:11.5, whiteSpace:"nowrap"}}>start at</span>
+                    <input className="input mono" type="number" min={500} step={500}
+                           value={adaptiveCoarse}
+                           onChange={e=>setAdaptiveCoarse(Math.max(500, +e.target.value || 4000))}
+                           style={{width:80, textAlign:"right"}}/>
+                    <span className="muted" style={{fontSize:11.5}}>m · splits down to {gridSize}m where dense</span>
+                  </div>
+                )}
+                {adaptiveGrid && (
+                  <p className="help" style={{marginTop:4}}>
+                    sparse areas covered at {adaptiveCoarse}m (up to {Math.round((adaptiveCoarse/gridSize)**2)}x fewer calls);
+                    cells hitting the ~60-result API ceiling split recursively. The cell count above is the
+                    worst case at {gridSize}m — the actual run makes far fewer calls.
+                  </p>
+                )}
               </div>
 
               <div className="field">
@@ -699,6 +762,35 @@ const NewRun = ({ setRoute, mapStyle }) => {
               </div>
             </>
           )}
+
+          {queueItems.length > 0 && (
+            <>
+              <hr className="hr"/>
+              <div className="field">
+                <div className="field-label">run queue · {queueItems.length} · processed one at a time</div>
+                {queueItems.map(it => (
+                  <div key={it.id} className="panel" style={{padding:"6px 10px", marginBottom:4, display:"flex", alignItems:"center", gap:8, fontSize:12}}>
+                    <span className="chip num" style={{
+                      color: it.status === "failed" ? "var(--st-failed)"
+                           : it.status === "running" ? "var(--accent)" : undefined
+                    }}>{it.status}</span>
+                    <div style={{flex:1, minWidth:0}}>
+                      <div style={{overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>{it.label}</div>
+                      <div className="muted num" style={{fontSize:10.5}}>
+                        {it.grid_size_meters}m · {(it.queries || "").split(",").filter(Boolean).length} queries
+                        {it.run_id ? ` · ${it.run_id}` : ""}
+                      </div>
+                    </div>
+                    {it.status === "running" && it.run_id ? (
+                      <button className="btn sm ghost" onClick={()=>setRoute("live", it.run_id)}>view</button>
+                    ) : (
+                      <button className="x" title="remove" onClick={()=>doQueueRemove(it.id)}><I.X size={10}/></button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </div>
 
         <footer className="run-config-foot">
@@ -723,6 +815,11 @@ const NewRun = ({ setRoute, mapStyle }) => {
               <button className="btn ghost" onClick={()=>setStage(1)}>
                 <I.ChevronLeft size={11}/> back
               </button>
+              <button className="btn" onClick={doQueueAdd}
+                      disabled={queueing || validQueries.length === 0 || cells <= 0}
+                      title="add to the run queue — runs launch one at a time">
+                <I.Plus size={11}/> {queueing ? "queuing…" : "queue"}
+              </button>
               <button className="btn primary" onClick={doStartRun} disabled={starting || validQueries.length === 0 || cells <= 0}>
                 <I.Play size={11}/> {starting ? "starting…" : "start run"}
               </button>
@@ -741,7 +838,8 @@ const NewRun = ({ setRoute, mapStyle }) => {
           <>
             {areaResolved
               ? <><span className="chip num">{(areaResolved.total_cells || 0).toLocaleString()} cells</span>
-                  <span style={{color:"var(--fg-2)"}}>{gridSize}m {gridShape}</span></>
+                  <span style={{color:"var(--fg-2)"}}>{gridSize}m {gridShape}</span>
+                  {gridSampled && <span className="faint">preview sampled · full grid at run time</span>}</>
               : <span className="faint">pick an area to preview the grid</span>}
           </>
         }

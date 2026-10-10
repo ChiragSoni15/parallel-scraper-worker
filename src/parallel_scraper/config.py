@@ -51,6 +51,16 @@ class ParallelConfig:
     city_name: str = "Mumbai"
     grid_size_meters: int = 1000
     grid_type: str = "square"
+    # ── adaptive (quadtree) discovery ───────────────────────────────────
+    # When on, Phase 1 starts from a coarse grid (adaptive_coarse_meters) and
+    # subdivides any (cell, query) whose unique-result count hits the
+    # saturation threshold (Text Search truncates around 60) into 4 quadrant
+    # children, recursively, down to grid_size_meters as the floor. Sparse
+    # regions get covered in far fewer calls; saturated urban cores get finer
+    # cells than the floor grid would ever see. places_api backend only.
+    adaptive_grid: bool = False
+    adaptive_coarse_meters: int = 4000
+    adaptive_saturation_threshold: int = 55
     queries: tuple[str, ...] = ("shops",)
     # Phase-1 (placeId discovery): Google Places Text Search by default.
     # Use "maps_frontend" only for the older Playwright Maps-search path.

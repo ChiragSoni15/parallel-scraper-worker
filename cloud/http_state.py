@@ -81,6 +81,14 @@ class HttpState:
         return self._request("POST", "/phase2/attributes",
                              json={"run_id": run_id, "rows": rows})
 
+    def mark_delisted(self, run_id: str, place_id: str, attempts: int, observed_at: str,
+                      evidence_text: str | None = None, page_url: str | None = None) -> dict:
+        """Tombstone a delisted place (design §8.4); lease-gated server side. {accepted, stale}."""
+        return self._request("POST", "/phase2/delisted",
+                             json={"run_id": run_id, "place_id": place_id, "attempts": int(attempts),
+                                   "observed_at": observed_at, "evidence_text": evidence_text,
+                                   "page_url": page_url})
+
     def reclaim_place_ids(self, run_id: str, older_than_minutes: int = 30) -> int:
         out = self._request("POST", "/phase2/reclaim",
                             json={"run_id": run_id, "older_than_minutes": int(older_than_minutes)})

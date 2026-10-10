@@ -16,9 +16,12 @@
 const { useState: useStateMap, useEffect: useEffectMap, useRef: useRefMap } = React;
 
 const TILE_PROVIDERS = {
+  // CARTO basemaps now need an API key (tiles come back as a watermark).
+  // Dark = plain OSM tiles inverted in CSS (see [data-mapstyle="dark"] in
+  // styles.css) — keyless and full zoom range.
   dark: {
-    url: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-    options: { maxZoom: 19, subdomains: "abcd", attribution: "© OSM · CARTO" },
+    url: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    options: { maxZoom: 19, attribution: "© OpenStreetMap" },
   },
   light: {
     url: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -35,6 +38,21 @@ function statusToCellClass(status) {
   if (status === "failed") return "failed";
   if (status === "in_progress" || status === "running") return "running";
   return "queued";
+}
+
+// fitBounds while the container is still collapsed (first paint: the map
+// pane measures ~260x1 px for over a second while the grid layout settles)
+// yields a NaN/max zoom and the view sticks at z19. Park the fit and let the
+// ResizeObserver below apply it once the container has a real size.
+function safeFit(map, bounds, opts) {
+  map.invalidateSize();
+  const sz = map.getSize();
+  if (sz.x < 50 || sz.y < 50) { map._pendingFit = { bounds, opts }; return; }
+  map._pendingFit = null;
+  // animate:false — programmatic fits go straight to _resetView instead of a
+  // requestAnimationFrame-scheduled zoom, which browsers pause for background
+  // tabs (the fit is then silently dropped and the old run's view stays).
+  map.fitBounds(bounds, { ...opts, animate: false });
 }
 
 function readAccent() {
@@ -68,7 +86,12 @@ const MapView = ({
     mapRef.current = map;
     onMapReady && onMapReady(map);
     setTimeout(() => map.invalidateSize(), 200);
-    return () => { map.remove(); mapRef.current = null; };
+    const ro = new ResizeObserver(() => {
+      map.invalidateSize();
+      if (map._pendingFit) safeFit(map, map._pendingFit.bounds, map._pendingFit.opts);
+    });
+    ro.observe(containerRef.current);
+    return () => { ro.disconnect(); map.remove(); mapRef.current = null; };
   }, []);
 
   // tile provider switch
@@ -76,7 +99,7 @@ const MapView = ({
     const map = mapRef.current; if (!map) return;
     if (tileRef.current) { map.removeLayer(tileRef.current); tileRef.current = null; }
     const p = TILE_PROVIDERS[mapStyle] || TILE_PROVIDERS.dark;
-    tileRef.current = L.tileLayer(p.url, { ...p.options, r: "@2x" }).addTo(map);
+    tileRef.current = L.tileLayer(p.url, { ...p.options }).addTo(map);
   }, [mapStyle]);
 
   // boundary
@@ -90,7 +113,7 @@ const MapView = ({
     }).addTo(map);
     boundaryRef.current = layer;
     if (fitTo === "boundary" || fitTo === "auto") {
-      try { map.fitBounds(layer.getBounds(), { padding: [20, 20] }); } catch {}
+      try { safeFit(map, layer.getBounds(), { padding: [20, 20] }); } catch {}
     }
   }, [boundary]);
 
@@ -137,7 +160,7 @@ const MapView = ({
         }
       }
       if (isFinite(minLat) && isFinite(maxLat)) {
-        map.fitBounds([[minLat, minLng], [maxLat, maxLng]], { padding: [20, 20] });
+        safeFit(map, [[minLat, minLng], [maxLat, maxLng]], { padding: [20, 20] });
       }
     } catch {}
   }, [grid]);
@@ -159,7 +182,7 @@ const MapView = ({
     gridRef.current = layer;
     cellByIdRef.current = byId;
     if (fitTo === "grid" || fitTo === "auto") {
-      try { map.fitBounds(layer.getBounds(), { padding: [20, 20] }); } catch {}
+      try { safeFit(map, layer.getBounds(), { padding: [20, 20] }); } catch {}
     }
   }, [grid]);
 
@@ -184,6 +207,17 @@ const MapView = ({
   // that vanished. Tooltips are omitted (they'd add back the 70K listener
   // hit we're avoiding) — hover-tooltips can be re-added later as a lazy
   // popup if needed.
+  // Rendered on a single canvas: a finished state-sized run has 20-70K
+  // touched cells, and that many SVG <path> nodes is what froze the tab on
+  // every tab switch. Canvas can't take CSS classes, so colours are explicit.
+  const CANVAS_STYLE = {
+    queued:  { fillColor: "#8a8f99", fillOpacity: 0.18, color: "#8a8f99", opacity: 0.35 },
+    running: { fillColor: "#7be060", fillOpacity: 0.45, color: "#7be060", opacity: 0.9 },
+    done:    { fillColor: "#5fb3b3", fillOpacity: 0.35, color: "#5fb3b3", opacity: 0.6 },
+    failed:  { fillColor: "#e0705a", fillOpacity: 0.40, color: "#e0705a", opacity: 0.8 },
+  };
+  const canvasRef = useRefMap(null);
+  const lastSigRef = useRefMap("");
   useEffectMap(() => {
     const map = mapRef.current; if (!map) return;
     const isLarge = grid && grid.features && grid.features.length > LARGE_GRID_THRESHOLD;
@@ -193,56 +227,36 @@ const MapView = ({
         map.removeLayer(gridRef.current);
         gridRef.current = null;
         cellByIdRef.current = {};
+        lastSigRef.current = "";
       }
       return;
     }
-    // Lazy-create the layer group on first call.
-    if (!gridRef.current || !gridRef.current._isTouchedOnly) {
-      if (gridRef.current) { map.removeLayer(gridRef.current); }
-      const grp = L.layerGroup().addTo(map);
-      grp._isTouchedOnly = true;
-      gridRef.current = grp;
-      cellByIdRef.current = {};
-    }
-    const grp = gridRef.current;
-    const byId = cellByIdRef.current;
     const featureMap = cellFeatureMapRef.current || {};
     const touched = (cellStates || []).filter(
       (c) => c.status && c.status !== "queued" && c.status !== "pending"
     );
-    const touchedIds = new Set(touched.map((c) => c.cell_id));
+    // Skip the rebuild when nothing changed (the poller already 304s, but a
+    // remount re-delivers the cached array).
+    let sig = touched.length + ":";
+    for (const c of touched) sig += c.cell_id + c.status.charCodeAt(0);
+    if (sig === lastSigRef.current && gridRef.current && gridRef.current._isTouchedOnly) return;
+    lastSigRef.current = sig;
 
-    // Drop layers for cells that are no longer touched (rare, but happens
-    // on resume or status corrections).
-    for (const cid of Object.keys(byId)) {
-      if (!touchedIds.has(cid)) {
-        try { grp.removeLayer(byId[cid]); } catch {}
-        delete byId[cid];
-      }
-    }
-
-    // Add/update each touched cell.
+    if (gridRef.current) { map.removeLayer(gridRef.current); }
+    if (!canvasRef.current) canvasRef.current = L.canvas({ padding: 0.5 });
+    const features = [];
     for (const c of touched) {
-      const cls = statusToCellClass(c.status);
-      let lyr = byId[c.cell_id];
-      if (!lyr) {
-        const feature = featureMap[c.cell_id];
-        if (!feature || !feature.geometry) continue;
-        lyr = L.geoJSON(feature, {
-          style: { className: `heat-cell ${cls}`, color: "transparent", fillOpacity: 1, weight: 0.5, opacity: 1 },
-        });
-        byId[c.cell_id] = lyr;
-        grp.addLayer(lyr);
-      } else {
-        // Layer already drawn — update its CSS class for status changes.
-        lyr.eachLayer((sub) => {
-          const el = sub.getElement && sub.getElement();
-          if (!el) return;
-          el.classList.remove("queued", "running", "done", "failed");
-          el.classList.add(cls);
-        });
-      }
+      const f = featureMap[c.cell_id];
+      if (f && f.geometry) features.push({ ...f, properties: { ...(f.properties || {}), status: c.status } });
     }
+    const layer = L.geoJSON({ type: "FeatureCollection", features }, {
+      renderer: canvasRef.current,
+      interactive: false,
+      style: (f) => ({ weight: 0.5, ...CANVAS_STYLE[statusToCellClass(f.properties.status)] }),
+    }).addTo(map);
+    layer._isTouchedOnly = true;
+    gridRef.current = layer;
+    cellByIdRef.current = {};
   }, [cellStates, grid]);
 
   // pins
@@ -266,7 +280,7 @@ const MapView = ({
     const grp = L.featureGroup(markers).addTo(map);
     pinGroupRef.current = grp;
     if ((fitTo === "pins" || fitTo === "auto") && markers.length) {
-      try { map.fitBounds(grp.getBounds(), { padding: [40, 40] }); } catch {}
+      try { safeFit(map, grp.getBounds(), { padding: [40, 40] }); } catch {}
     }
   }, [pins, selectedPinId]);
 

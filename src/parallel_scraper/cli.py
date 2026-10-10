@@ -29,6 +29,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--city", default="Mumbai")
     p.add_argument("--grid-size-meters", type=int, default=1000)
     p.add_argument("--grid-type", default="square", choices=["square", "hex"])
+    p.add_argument("--adaptive-grid", action="store_true",
+                   help="Quadtree discovery: start at --adaptive-coarse-meters and "
+                        "subdivide saturated cells down to --grid-size-meters")
+    p.add_argument("--adaptive-coarse-meters", type=int, default=4000,
+                   help="Starting cell edge for --adaptive-grid (default 4000)")
     p.add_argument("--queries", default=None,
                    help="Comma-separated list of search queries (e.g. shops,restaurants). "
                         "On resume, omit to inherit queries from run_config.json.")
@@ -231,6 +236,20 @@ def main(argv: list[str] | None = None) -> int:
     # new query to Phase 1's work set).
     queries = _resolve_queries(args, run_dir if args.run_id else None)
 
+    # Resume: run_config.json is authoritative for adaptive-grid settings —
+    # same rationale as queries above. A forgotten --adaptive-grid on resume
+    # would regenerate root cells at the floor size with different cell ids,
+    # orphaning every done-cell state row.
+    if args.run_id:
+        try:
+            cfg_prev = json.loads((run_dir / "run_config.json").read_text(encoding="utf-8"))
+            if "adaptive_grid" in cfg_prev:
+                args.adaptive_grid = bool(cfg_prev["adaptive_grid"])
+                args.adaptive_coarse_meters = int(
+                    cfg_prev.get("adaptive_coarse_meters", args.adaptive_coarse_meters))
+        except FileNotFoundError:
+            pass
+
     # Resolve columns BEFORE constructing ParallelScraper (which writes run_config.json).
     selected_columns = _resolve_columns(args, run_dir if args.run_id else Path("/__never_exists__"))
 
@@ -242,6 +261,8 @@ def main(argv: list[str] | None = None) -> int:
         city_name=args.city,
         grid_size_meters=args.grid_size_meters,
         grid_type=args.grid_type,
+        adaptive_grid=args.adaptive_grid,
+        adaptive_coarse_meters=args.adaptive_coarse_meters,
         queries=queries,
         discovery_backend=args.discovery_backend,
         places_tier=args.places_tier,

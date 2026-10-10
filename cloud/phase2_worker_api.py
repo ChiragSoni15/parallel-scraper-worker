@@ -18,12 +18,15 @@ import shutil
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from parallel_scraper.logging_setup import phase_var, run_id_var, setup_logging
 
+from cloud import delisted
 from cloud.http_state import HttpState
 from cloud.phase2_common import P2Result, _default_session_factory, _split_image_urls
+_RECLAIM_MIN = int(os.environ.get("PHASE2_RECLAIM_MINUTES", "30") or "30")
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +77,8 @@ def _sink_shots(state, run_id, pid, attempts, shots):
 
 
 def _sink_photos(run_id, pid, image_urls):
-    """Mirror place photos (CDN URLs) into Blob under <run_id>/<pid>/. Best-effort:
+    """LEGACY (PHASE2_LEGACY_PANEL_PHOTOS=1 only; the gallery flow is _photos_one).
+    Mirror place photos (CDN URLs) into Blob under <run_id>/<pid>/. Best-effort:
     never fails the scrape; no artifact fallback (the CDN URLs stay in the metadata,
     so photos can be backfilled later by re-fetching them)."""
     from cloud import blob_shots
@@ -111,6 +115,146 @@ def _media_one(session, run_id, pid, row):
                                run_id, pid, exc_info=True)
     except Exception:
         logger.warning("phase2.media_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
+
+
+_TL = threading.local()
+
+
+def _http_get(url: str, timeout: float) -> bytes | None:
+    """GET a CDN image with one requests.Session per thread (§9.1). None unless 200 + body."""
+    import requests
+    s = getattr(_TL, "http", None)
+    if s is None:
+        s = _TL.http = requests.Session()
+    r = s.get(url, timeout=timeout)
+    return r.content if r.status_code == 200 and r.content else None
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _ms(a: float, b: float) -> int:
+    return int((b - a) * 1000)
+
+
+def _full_url(it: dict) -> str | None:
+    """Google CDN URL of a walked item: the viewer's own image URL (`!6s`, see
+    horeca_capture), else the lh3 path of an AF1Qip photo id from the viewer key
+    (`!1s`). mirror_selected rewrites either to =s1600."""
+    key = it.get("viewer_key") or ""
+    if not it.get("url") and key.startswith("AF1Qip"):
+        return f"https://lh3.googleusercontent.com/p/{key}"
+    return it.get("url")
+
+
+def _photos_one(run_id, pid, row, panel_urls) -> tuple[list[dict], dict]:
+    """Design §1 steps 2-4: select_photos -> mirror_selected -> place_media rows, and
+    row["photo_dates"]["summary"] (§4.3). Returns (media, {thumbs, mirror} ms).
+    Never raises: an error here is recorded as a failed walk, so the repair pass
+    (media_partial=1) picks the place up again."""
+    from cloud import blob_shots
+    from parallel_scraper import gallery_select as gs
+    tm = {"thumbs": 0, "mirror": 0}
+    pd = row.get("photo_dates") or {}
+    items = pd.get("items") or []
+    wm = pd.get("walk_meta") or {"walk_ok": False, "reason": "no_capture"}
+    selected, outcomes, media = [], None, []
+    try:
+        # Identity = viewer key, not URL: one photo can arrive under different URL
+        # paths. A repeat is merged, not dropped (gallery_select §2 step 4 rules):
+        # union of sources (owner wins as primary), newest caption, first ordinal.
+        by_key, cands = {}, []
+        for it in sorted(items, key=lambda i: i.get("ordinal", 0)):
+            k = it.get("viewer_key")
+            c = by_key.get(k) if k else None
+            if c is None:
+                c = {**it, "url": _full_url(it), "sources": [it.get("source") or "gallery"]}
+                cands.append(c)
+                if k:
+                    by_key[k] = c
+                continue
+            src = it.get("source") or "gallery"
+            if src not in c["sources"]:
+                c["sources"].append(src)
+            if "owner" in c["sources"]:
+                c["source"] = "owner"
+            new_m = gs.parse_photo_month(it.get("caption"))
+            if new_m and new_m > (gs.parse_photo_month(c.get("caption")) or ""):
+                c["caption"] = it.get("caption")
+        sv = next((c for c in cands if c.get("kind") == "street_view" and c.get("url")), None) \
+            or next(({"url": u} for u in panel_urls if "streetviewpixels" in u), None)
+        if not wm.get("walk_ok"):   # panel strip: fallback source only (§1)
+            cands = [{"kind": "photo", "url": u, "source": "panel", "ordinal": i}
+                     for i, u in enumerate(panel_urls)]
+        key_of = {c["url"]: c.get("viewer_key") or c["url"] for c in cands if c.get("url")}
+        thumbs: dict = {}
+
+        def fetch_thumb(url):   # keyed by viewer key: each photo fetched once (§9.1)
+            k = key_of.get(url, url)
+            if k not in thumbs:
+                thumbs[k] = _http_get(gs.thumb_url(url), 3)
+            return thumbs[k]
+
+        t0 = time.monotonic()
+        selected = gs.select_photos(
+            cands, now=datetime.now(timezone.utc),
+            cap=int(os.environ.get("PHASE2_PHOTOS_MAX") or 20),
+            thresh=int(os.environ.get("PHASE2_DHASH_THRESHOLD") or 8),
+            owner_count_known=bool(wm.get("owner_count_known")),
+            owner_count=wm.get("owner_count"), fetch_thumb=fetch_thumb)
+        tm["thumbs"] = _ms(t0, time.monotonic())
+        if sv:   # §7: its own row, ordinal n, outside the keep cap
+            selected.append(gs.Selected(
+                url=blob_shots._upscale_url(sv["url"]), sources={"street_view"},
+                source="street_view", photo_month=gs.parse_photo_month(sv.get("caption")),
+                photo_date_raw=sv.get("caption"), ordinal=len(selected)))
+        sas = blob_shots.blob_sas_url() if blob_shots.photos_enabled() else None
+        t0 = time.monotonic()
+        # No SAS (or PHASE2_PHOTOS_TO_BLOB=0): nothing is mirrored. Skip the CDN fetch; rows stay 'failed'.
+        outcomes = blob_shots.mirror_selected(
+            run_id, pid, selected, fetch=(lambda u: _http_get(u, 20)) if sas else (lambda u: None))
+        tm["mirror"] = _ms(t0, time.monotonic())
+        base = blob_shots._split_sas(sas)[0] if sas else ""
+        fetched_at = _utc_iso()
+        for sel, o in zip(selected, outcomes):
+            is_sv = sel.source == "street_view"
+            media.append({
+                "ordinal": o["ordinal"], "kind": "street_view" if is_sv else "photo",
+                "source_url": blob_shots._source_url(sel),
+                "blob_url": f"{base}/{o['blob_name']}" if o["blob_name"] else None,
+                "posted_month": sel.photo_month, "caption_raw": sel.photo_date_raw,
+                "source": sel.source, "status": o["status"], "sha1": o["sha1"],
+                "width": o["width"], "height": o["height"], "bytes": o["bytes"],
+                "dhash": gs.signed64(sel.dhash), "stale": sel.stale, "fetched_at": fetched_at,
+                "pano_url": sv.get("pano_url") if is_sv else None})
+    except Exception:
+        logger.warning("phase2.photos_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
+        wm = {**wm, "walk_ok": False, "reason": "photo_pipeline_error"}
+        selected, outcomes, media = [], None, []
+    summ = gs.summary(items, selected, wm, outcomes)
+    # §8.3: a failed walk stores only the summary, never a partial photo_dates.
+    row["photo_dates"] = {**pd, "summary": summ} if summ["walk_ok"] else {"summary": summ}
+    return media, tm
+
+
+def _page_url(session) -> str:
+    return session.page_state()[0] if hasattr(session, "page_state") else ""
+
+
+def _delisted_or_raise(session, state, run_id, pid, attempts) -> None:
+    """Blank/FAILED scrape (§8.4, §9). /sorry/ -> BOT_PAGE, raise (retried). A known
+    removal text -> POST /phase2/delisted and return. Anything else -> raise as before."""
+    url, text = session.page_state(True) if hasattr(session, "page_state") else ("", "")
+    if "/sorry/" in url:
+        logger.warning("BOT_PAGE url=%s pid=%s", url, pid)
+        raise RuntimeError(f"bot page: {url}")
+    ev = delisted.detect_delisted(text, url)
+    if not ev:
+        raise RuntimeError("blank-after-warmup / no data")
+    out = state.mark_delisted(run_id, pid, attempts, _utc_iso(), ev, url) or {}
+    logger.info("phase2.delisted run_id=%s pid=%s accepted=%s url=%s",
+                run_id, pid, out.get("accepted"), url)
 
 
 def _panel_extras_one(session, run_id, pid):
@@ -212,7 +356,7 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
 
     if str(shard) == "0":
         try:
-            logger.info("phase2.reclaim run_id=%s reclaimed=%d", run_id, state.reclaim_place_ids(run_id, 30))
+            logger.info("phase2.reclaim run_id=%s reclaimed=%d", run_id, state.reclaim_place_ids(run_id, _RECLAIM_MIN))
         except Exception:
             logger.warning("phase2.reclaim_failed", exc_info=True)
 
@@ -261,32 +405,16 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
             for rec in leased:
                 pid = str(rec["place_id"])
                 attempts = int(rec["attempts"])
-                try:
-                    row = session.scrape(pid)
-                    if not row or (row.get("name") or "") in ("", "FAILED"):
-                        raise RuntimeError("blank-after-warmup / no data")
-                    _media_one(session, run_id, pid, row)   # before serializing
-                    urls = _split_image_urls(row.get("image_urls"))
-                    pend_done.append({"place_id": pid, "attempts": attempts,
-                                      "data": json.dumps(row, default=str), "image_urls": urls})
-                    _ex = _panel_extras_one(session, run_id, pid)   # last: it re-navigates
-                    if _ex:
-                        pend_attrs.append(_ex)
-                    _sink_photos(run_id, pid, urls)
-                    # Page screenshots ride a separate multipart endpoint (bytes -> API ->
-                    # Drive), guarded by the same lease attempts. Best-effort: a failed
-                    # upload must never fail the scrape or block the metadata submit.
-                    if capture_shots:
-                        try:
-                            shots = (session.screenshot_paths(pid)
-                                     if hasattr(session, "screenshot_paths") else {})
-                            _sink_shots(state, run_id, pid, attempts, shots)
-                        except Exception:
-                            logger.warning("phase2.shot_sink_failed run_id=%s pid=%s",
-                                           run_id, pid, exc_info=True)
-                except Exception as exc:
-                    logger.warning("phase2.place_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
-                    pend_failed.append({"place_id": pid, "attempts": attempts, "error": str(exc)})
+                done, failed, ex = _scrape_one(session, run_id, pid, attempts,
+                                               capture_shots, state, state)
+                if done is not None:
+                    pend_done.append(done)
+                elif failed is not None:
+                    pend_failed.append(failed)
+                else:
+                    result.done += 1     # delisted: tombstoned, counts as done (§9)
+                if ex:
+                    pend_attrs.append(ex)
                 n_since_recycle += 1
                 if n_since_recycle >= recycle_every:
                     try:
@@ -306,22 +434,32 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
     return result
 
 
-def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state):
-    """Scrape a single pid on `session`.
-    Return (done_dict_or_None, failed_dict_or_None, extras_row_or_None).
+def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state, state=None):
+    """Scrape a single pid on `session` (design §1 order: panel, gallery walks,
+    select + mirror, then serialize). Return (done, failed, extras); all three None
+    when the place was tombstoned as delisted (§8.4) through `state` (default
+    shot_state; the gated state in main()).
 
     Screenshot upload uses `shot_state` (this thread's own HttpState) and is
     best-effort: a failed upload must never fail the scrape or block the submit.
     """
+    state = state if state is not None else shot_state
+    t0 = time.monotonic()
     try:
         row = session.scrape(pid)
         if not row or (row.get("name") or "") in ("", "FAILED"):
-            raise RuntimeError("blank-after-warmup / no data")
-        _media_one(session, run_id, pid, row)   # before serializing
+            _delisted_or_raise(session, state, run_id, pid, attempts)
+            return None, None, None
+        t_panel = time.monotonic()
+        _media_one(session, run_id, pid, row)
+        t_walk = time.monotonic()
         urls = _split_image_urls(row.get("image_urls"))
+        media, tm = (_photos_one(run_id, pid, row, urls) if hasattr(session, "media_capture")
+                     else ([], {"thumbs": 0, "mirror": 0}))
         done = {"place_id": pid, "attempts": attempts,
-                "data": json.dumps(row, default=str), "image_urls": urls}
-        _sink_photos(run_id, pid, urls)
+                "data": json.dumps(row, default=str), "image_urls": urls, "media": media}
+        if os.environ.get("PHASE2_LEGACY_PANEL_PHOTOS", "0") == "1":
+            _sink_photos(run_id, pid, urls)
         if capture_shots:
             try:
                 shots = (session.screenshot_paths(pid)
@@ -331,9 +469,16 @@ def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state):
                 logger.warning("phase2.shot_sink_failed run_id=%s pid=%s",
                                run_id, pid, exc_info=True)
         # Last, because it re-navigates the page away from the scraped panel.
-        return done, None, _panel_extras_one(session, run_id, pid)
+        extras = _panel_extras_one(session, run_id, pid)
+        # ponytail: reviews=-1 = not measured; Reviews->Newest runs inside session.scrape
+        # (vendored extractor) and is counted in panel. Split it there if p10 needs it.
+        logger.info("TIMING pid=%s panel=%d reviews=-1 walk=%d thumbs=%d mirror=%d total=%d",
+                    pid, _ms(t0, t_panel), _ms(t_panel, t_walk), tm["thumbs"], tm["mirror"],
+                    _ms(t0, time.monotonic()))
+        return done, None, extras
     except Exception as exc:
-        logger.warning("phase2.place_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
+        logger.warning("phase2.place_failed run_id=%s pid=%s url=%s", run_id, pid,
+                       _page_url(session), exc_info=True)
         return None, {"place_id": pid, "attempts": attempts, "error": str(exc)}, None
 
 
@@ -347,7 +492,7 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
     """
     if str(shard) == "0":
         try:
-            logger.info("phase2.reclaim run_id=%s reclaimed=%d", run_id, state.reclaim_place_ids(run_id, 30))
+            logger.info("phase2.reclaim run_id=%s reclaimed=%d", run_id, state.reclaim_place_ids(run_id, _RECLAIM_MIN))
         except Exception:
             logger.warning("phase2.reclaim_failed", exc_info=True)
 
@@ -374,7 +519,8 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
         try:
             work_dir = tempfile.mkdtemp(prefix=f"p2api_{idx}_")
             session = factory(work_dir=work_dir)
-            shot_state = HttpState() if state.__class__ is HttpState else state.__class__()
+            inner = getattr(state, "_inner", state)   # main() wraps it in _GateState
+            shot_state = HttpState() if inner.__class__ is HttpState else inner.__class__()
         except Exception:
             # Session/state setup failed: drain the queue marking pids failed so
             # nothing is lost, until a sentinel arrives. Never block the feeder.
@@ -397,12 +543,14 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
                 return
             pid, attempts = item
             done, failed, extras = _scrape_one(session, run_id, pid, attempts,
-                                               capture_shots, shot_state)
+                                               capture_shots, shot_state, state)
             with lock:
                 if done is not None:
                     pend_done.append(done)
-                else:
+                elif failed is not None:
                     pend_failed.append(failed)
+                else:
+                    result.done += 1     # delisted: tombstoned, counts as done (§9)
                 if extras:
                     pend_attrs.append(extras)
             n_since_recycle += 1
@@ -510,7 +658,85 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
     return result
 
 
-def main(argv=None) -> int:
+class _GateState:
+    """Wraps the state backend for main()'s shard gate (design §9, level 1).
+
+    Counts what was leased and what the API accepted, so main() can tell lost work
+    without reaching into the scrape loop. Everything else passes straight through."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.leased = 0          # pids handed to this shard
+        self.submitted = 0       # rows in submits that returned (accepted or stale)
+        self.acc_done = 0
+        self.acc_failed = 0
+        self._warned = False
+        self._first_lease = self._first_done = False
+        self._lock = threading.Lock()   # mark_delisted comes from the K worker threads
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def claim_place_ids(self, run_id, worker, n):
+        out = self._inner.claim_place_ids(run_id, worker, n)
+        if out:
+            self.leased += len(out)
+            if not self._first_lease:
+                self._first_lease = True
+                print(f"STARTUP t_first_lease={int(time.time())}", flush=True)
+        return out
+
+    def submit(self, run_id, done, failed):
+        out = self._inner.submit(run_id, done, failed) or {}
+        with self._lock:
+            self.submitted += len(done) + len(failed)
+            if "accepted_done" in out and "accepted_failed" in out:
+                self.acc_done += int(out["accepted_done"])
+                self.acc_failed += int(out["accepted_failed"])
+            else:
+                if not self._warned:
+                    self._warned = True
+                    logger.warning("phase2.gate no accepted_done/accepted_failed in submit response; "
+                                   "falling back to submitted counts (stale rows count as accepted)")
+                self.acc_done += len(done)
+                self.acc_failed += len(failed)
+        if self.acc_done and not self._first_done:
+            # ponytail: measured at first accepted submit, so includes up to one flush interval
+            self._first_done = True
+            print(f"STARTUP t_first_done={int(time.time())}", flush=True)
+        return out
+
+
+    def mark_delisted(self, *args, **kwargs):
+        """An accepted tombstone counts as done (§9); a stale one as submitted only."""
+        out = self._inner.mark_delisted(*args, **kwargs) or {}
+        with self._lock:
+            self.submitted += 1
+            self.acc_done += int(out.get("accepted", 0))
+        return out
+
+
+def shard_exit_code(gate: _GateState, max_fail: float) -> int:
+    """0 ok, 3 = this shard lost work (§9 level 1). Results are already flushed."""
+    lost = gate.leased - gate.submitted
+    den = gate.acc_done + gate.acc_failed
+    rate = gate.acc_failed / den if den else 0.0
+    logger.info("phase2.gate leased=%d submitted=%d accepted_done=%d accepted_failed=%d "
+                "unflushed=%d fail_rate=%.3f max=%.3f",
+                gate.leased, gate.submitted, gate.acc_done, gate.acc_failed, lost, rate, max_fail)
+    if lost > 0:
+        logger.error("phase2.gate exit=3 reason=unflushed_buffer rows=%d", lost)
+        return 3
+    if gate.leased and not den:
+        logger.error("phase2.gate exit=3 reason=no_accepted_rows leased=%d", gate.leased)
+        return 3
+    if rate > max_fail:
+        logger.error("phase2.gate exit=3 reason=fail_rate %.3f > %.3f", rate, max_fail)
+        return 3
+    return 0
+
+
+def main(argv=None, state=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-id", required=True)
     ap.add_argument("--shard", required=True)
@@ -519,12 +745,17 @@ def main(argv=None) -> int:
     ap.add_argument("--max-places", type=int)
     ap.add_argument("--concurrency", type=int, default=None,
                     help="placeIds scraped at once per shard (1-5; env PHASE2_CONCURRENCY is the fallback)")
+    ap.add_argument("--max-fail-pct", type=float,
+                    default=100 * float(os.environ.get("PHASE2_SHARD_MAX_FAIL") or 0.10),
+                    help="exit 3 when accepted failed/(done+failed) exceeds this %% "
+                         "(env PHASE2_SHARD_MAX_FAIL as a fraction, default 0.10)")
     args = ap.parse_args(argv)
     setup_logging(None, level="INFO")
+    gate = _GateState(state if state is not None else HttpState())
     run_worker(args.run_id, args.shard, max_minutes=args.max_minutes,
                batch=args.batch, max_places=args.max_places,
-               concurrency=args.concurrency)
-    return 0
+               concurrency=args.concurrency, state=gate)
+    return shard_exit_code(gate, args.max_fail_pct / 100.0)
 
 
 if __name__ == "__main__":

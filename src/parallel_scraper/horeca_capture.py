@@ -5,56 +5,142 @@ already on the place panel with warm cookies). Ported from tools/menu_probe.py,
 which was validated on 151 Riyadh outlets (see menu_batch_riyadh.jsonl).
 
 Hard-won behaviors baked in (do not "simplify" these away):
-- The gallery viewer's main image is NOT a queryable <img> (canvas-rendered):
-  full-res URLs are captured by sniffing lh3.googleusercontent responses with a
-  large =w/=s size param.
+- The gallery viewer's main image is a <canvas>, not a queryable <img>. The item's
+  own image URL is in the viewer URL (`!6s<url>`) next to its id (`!1s<id>`), so
+  the key and the image come from ONE read of location.href (checked live, Oct 2026).
 - Advancing slides works reliably via the visible "Next" button; ArrowRight
   does not always reach the viewer.
-- Caption in the top-left header ("Photo - Jun 2026" / "Video - Jul 2026") is
-  the item's date; the bottom "Image capture:" bar is Street View attribution
-  (also the date for street-view items). Both are month precision only.
-- Videos load no new big image, so their sniffed URL is a neighbour's — null it.
+- Caption in the top-left title card ("Photo - Jun 2026" / "Video - Jul 2026") is
+  the item's date; the bottom "Image capture:" bar is attribution (the date for
+  street-view items). Both are month precision only. The title card is ONE node
+  for all slides; it re-renders ~250 ms BEFORE the URL key changes (measured), so
+  "caption belongs to the new key" = the title card mutated after the click AND
+  the key changed (design §9.1 item rule).
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
+import time
+
+from playwright.async_api import TimeoutError as PWTimeout
 
 logger = logging.getLogger(__name__)
 
 PHOTO_CAP_DEFAULT = 12        # menu cards (horeca=1 only)
-# place-photo date walk cap. The dates feed the Phase 3 vision pass (pick recent
-# storefront/shelf shots), so a pool of 20 is enough; ~85% of target outlets have <=20
-# photos and are dated in full. Also keeps every walk far inside the 30-min lease (an
-# uncapped 13k-photo hypermarket took ~2.5 h and was marked failed). NB gallery order is
-# Google's, not newest-first. 0 = no cap; env PHASE2_PHOTO_DATES_CAP overrides.
-PLACE_PHOTO_CAP_DEFAULT = 20
-_WALK_GUARD = 5000            # loop guard for the uncapped walk, not a data cap
+# Walk limits per chip walk (design §5). One default each; env overrides are read
+# by phase2_metadata.media_capture. Photo cap 0 = no photo cap.
+WALK_PHOTO_CAP_DEFAULT = 40
+WALK_MAX_ITEMS_DEFAULT = 120
+WALK_MAX_S_DEFAULT = 90
+OWNER_PHOTO_CAP = 21          # the 21st photo tells "20 or fewer" from "more" (§5)
+PLACE_PHOTO_CAP_DEFAULT = WALK_PHOTO_CAP_DEFAULT   # old name, kept for importers
 
-_EVAL_CURRENT_ITEM = """() => {
-    let best = null, bestA = 0;
-    document.querySelectorAll('img[src*="googleusercontent"], img[src*="streetviewpixels"]').forEach(im => {
-        const r = im.getBoundingClientRect();
-        if (r.width < 250 || r.height < 250) return;
-        const a = r.width * r.height;
-        if (a > bestA) { bestA = a; best = im.src; }
-    });
-    let vid = null;
-    document.querySelectorAll('video').forEach(v => {
-        const r = v.getBoundingClientRect();
-        if (r.width >= 250 && r.left >= 0 && r.left < innerWidth) vid = v.currentSrc || 'video';
-    });
-    let cap = null, attr = null;
-    for (const el of document.querySelectorAll('div,span')) {
-        const t = (el.textContent || '').trim();
-        if (el.children.length !== 0 || t.length > 45) continue;
-        const r = el.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) continue;
-        if (/^(Photo|Video)\\s*[-\\u2013]/.test(t) && r.top < 200 && !cap) cap = t;
-        if (/^Image capture:/i.test(t) && !attr) attr = t;
+ITEM_TIMEOUT_MS = 8_000       # today's Next ceiling (26 x 300 ms)
+CHIP_TIMEOUT_MS = 2_000       # today's chip sleep, now a ceiling
+LAZY_TIMEOUT_MS = 4_000       # today's lazy-load ceiling (8 x 500 ms)
+
+# ONE read of the current viewer item (§9.1 item rule). Also installs, once per
+# page, a MutationObserver that counts title-card re-renders (tc_gen).
+_SNAP = r"""() => {
+    const W = window, TC = '[jsaction*="titlecard"]';
+    if (!W.__psTc) {
+        W.__psTc = {gen: 0};
+        try {
+            new MutationObserver(ms => {
+                for (const m of ms) {
+                    const t = m.target.nodeType === 1 ? m.target : m.target.parentElement;
+                    let hit = !!(t && t.closest && t.closest(TC));
+                    if (!hit) for (const n of m.addedNodes)
+                        if (n.nodeType === 1 && (n.matches(TC) || n.querySelector(TC))) { hit = true; break; }
+                    if (hit) { W.__psTc.gen++; break; }
+                }
+            }).observe(document.body, {subtree: true, childList: true, characterData: true});
+        } catch (e) {}
     }
-    return {img: best, vid, cap, attr};
+    const dec = s => { try { return decodeURIComponent(s); } catch (e) { return s; } };
+    const href = location.href, data = href.split('/data=')[1] || '';
+    const km = /!1s([^!?]+)/.exec(data), sm = /!6s([^!?]+)/.exec(data);
+    const key = km ? dec(km[1]) : href;
+    let thumb = sm ? dec(sm[1]) : null;
+    if (thumb && thumb.startsWith('//')) thumb = 'https:' + thumb;
+    // The item's image is the one carrying the current key's !6s id; a neighbour that is
+    // loaded (or larger) must never pass for it. No !6s (a lone Street View pano): the
+    // streetviewpixels image only.
+    const sid = thumb ? ((/panoid=([^&]+)/.exec(thumb) || [])[1] || thumb.split('=')[0].split('/').pop()) : null;
+    let im = null;
+    for (const i of document.querySelectorAll('img[src*="googleusercontent"], img[src*="streetviewpixels"]')) {
+        const r = i.getBoundingClientRect();
+        if (r.width < 250 || r.height < 250) continue;
+        if (sid ? i.src.includes(sid) : i.src.includes('streetviewpixels')) { im = i; break; }
+    }
+    let src = im ? im.src : thumb, complete = false, nw = 0;
+    if (im) { complete = im.complete; nw = im.naturalWidth; }
+    else if (src) {
+        if (!W.__psPre || Object.keys(W.__psPre).length > 300) W.__psPre = {};
+        let p = W.__psPre[src];
+        if (!p) { p = new Image(); p.src = src; W.__psPre[src] = p; }
+        complete = p.complete; nw = p.naturalWidth;
+    }
+    const leaf = (root, re, maxTop) => {
+        for (const el of root.querySelectorAll('div,span')) {
+            const t = (el.textContent || '').trim();
+            if (el.children.length !== 0 || t.length > 45 || !re.test(t)) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0 || r.top >= maxTop) continue;
+            return [el, t];
+        }
+        return [null, null];
+    };
+    const tc = document.querySelector(TC);
+    const [capEl, cap] = leaf(tc || document, /^(Photo|Video)\s*[-–]/, 200);
+    const [, attr] = leaf(document, /^Image capture:/i, 1e9);
+    return {viewer_url_key: key, img_src: src, caption: cap, attr,
+            slide_key: capEl && tc && tc.contains(capEl) ? key : null,
+            tc_gen: W.__psTc.gen, img_complete: complete, natural_width: nw, href};
 }"""
+
+# Ready predicate for wait_for_function: returns the snapshot when ready.
+# a = the snapshot taken just before the click (viewer_url_key, img_src, tc_gen).
+_ITEM_READY = "(a) => { const s = (" + _SNAP + r""")();
+    // First item of a new chip can be the photo already shown (owner #1 == All #1,
+    // seen live): accept it only when its image is the new grid's first thumb.
+    if (a.grid0 && s.img_src && s.img_src.split('=')[0] === a.grid0 && s.img_complete
+        && s.natural_width > 0 && s.caption && s.tc_gen > a.tc_gen
+        && s.slide_key === s.viewer_url_key) return s;
+    if (s.viewer_url_key === a.viewer_url_key) return false;
+    const capOk = s.caption && s.tc_gen > a.tc_gen && s.slide_key === s.viewer_url_key;
+    if (s.caption && /^video/i.test(s.caption)) return capOk ? s : false;   // §6: no video wait
+    if (!s.img_src || s.img_src === a.img_src || !s.img_complete || !(s.natural_width > 0)) return false;
+    if (s.caption) return capOk ? s : false;
+    return s.attr ? s : false;      // Street View: only the "Image capture" bar
+}"""
+
+_GRID = r"""() => {
+    const t = [...document.querySelectorAll('[data-photo-index]')];
+    const k = el => {
+        const b = el.querySelector('[style*="background-image"]') || el;
+        const m = /url\(["']?([^"')]+)/.exec(b.getAttribute('style') || '');
+        if (m) return m[1].split('=')[0];
+        const im = el.querySelector('img');
+        return im ? im.src.split('=')[0] : null;
+    };
+    return {count: t.length, keys: t.slice(0, 3).map(k)};
+}"""
+
+# Chip readiness (§9.1): first 3 grid keys differ from a.prev AND count stable 500 ms.
+_CHIP_READY = "(a) => { const g = (" + _GRID + r""")(), ks = JSON.stringify(g.keys);
+    if (a.need_change && ks === a.prev) { window.__psChip = null; return false; }
+    const now = performance.now(), st = window.__psChip;
+    if (!st || st.n !== g.count || st.k !== ks) { window.__psChip = {n: g.count, k: ks, t: now}; return false; }
+    return now - st.t >= 500 ? g : false;
+}"""
+
+_TABS = r"""() => [...document.querySelectorAll('[role=tab]')]
+    .filter(t => { const r = t.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+    .map(t => [(t.getAttribute('aria-label') || t.textContent || '').trim(),
+               t.getAttribute('aria-selected') === 'true'])"""
 
 _EVAL_STRIP_SRCS = """() => {
     const srcs = [];
@@ -65,27 +151,20 @@ _EVAL_STRIP_SRCS = """() => {
     return [...new Set(srcs)];
 }"""
 
-
-class _Skip(Exception):
-    """Section switched off — not an error, nothing recorded."""
-
-
-async def _click_next(page) -> None:
-    nxt = page.locator('button[aria-label*="Next" i]').first
-    try:
-        if await nxt.count():
-            await nxt.click(timeout=3_000)
-            return
-    except Exception:
-        pass
-    await page.keyboard.press("ArrowRight")
-
-
 _NEXT_DISABLED = """() => {
     const b = document.querySelector('button[aria-label*="Next" i]');
     return !!(b && (b.disabled || b.getAttribute('aria-disabled') === 'true'));
 }"""
 
+# Gallery chips render after the first item: wait for a tab not in `before`.
+_NEW_TABS = r"""(before) => [...document.querySelectorAll('[role=tab]')].some(t => {
+    const r = t.getBoundingClientRect(), l = (t.getAttribute('aria-label') || t.textContent || '').trim();
+    return r.width > 0 && r.height > 0 && l && !before.includes(l); })"""
+
+_VIEWER_CLOSED ="""() => !document.querySelector('button[aria-label*="Next" i]')"""
+
+_ENTRY_PRESENT = """() => !!document.querySelector('button[jsaction*="heroHeaderImage"]')
+    || [...document.querySelectorAll('button')].some(b => (b.textContent || '').includes('See photos'))"""
 
 # Bring the LAST loaded thumbnail into view: the grid lazy-loads on intersection, so
 # setting scrollTop on containers did nothing, while scrollIntoView loaded the next
@@ -98,214 +177,391 @@ _SCROLL_GRID = """() => {
     return t.length;
 }"""
 
+_GROWN = """(n) => {
+    if (document.querySelectorAll('[data-photo-index]').length > n) return true;
+    const b = document.querySelector('button[aria-label*="Next" i]');
+    return !!(b && !b.disabled && b.getAttribute('aria-disabled') !== 'true');
+}"""
 
-async def _load_more(page) -> bool:
+
+class _Skip(Exception):
+    """Section switched off — not an error, nothing recorded."""
+
+
+def _ms_left(deadline: float | None, cap_ms: int) -> int:
+    if deadline is None:
+        return cap_ms
+    return max(1, min(cap_ms, int((deadline - time.monotonic()) * 1000)))
+
+
+async def _snap(page) -> dict:
+    return await page.evaluate(_SNAP)
+
+
+async def _wait_item(page, prev: dict, timeout_ms: int) -> dict | None:
+    """Wait (50 ms poll) until the item rule holds against `prev`; None = timeout."""
+    try:
+        h = await page.wait_for_function(_ITEM_READY, arg=prev, polling=50,
+                                         timeout=max(1, timeout_ms))
+        return await h.json_value()
+    except PWTimeout:
+        return None
+
+
+async def _wait_js(page, expr: str, arg=None, timeout_ms: int = 1_000) -> bool:
+    try:
+        await page.wait_for_function(expr, arg=arg, polling=50, timeout=max(1, timeout_ms))
+        return True
+    except PWTimeout:
+        return False
+
+
+async def _click_next(page, timeout_ms: int = 3_000) -> None:
+    nxt = page.locator('button[aria-label*="Next" i]').first
+    try:
+        if await nxt.count():
+            # In-page click: a pane overlay ate pointer clicks for the full timeout
+            # (3 s per item, seen live Oct 2026), same as the entry clicks below.
+            await nxt.evaluate("e => e.click()", timeout=timeout_ms)
+            return
+    except Exception:
+        pass
+    await page.keyboard.press("ArrowRight")
+
+
+async def _load_more(page, timeout_ms: int = LAZY_TIMEOUT_MS) -> bool:
     """The 'See photos' grid lazy-loads ~10 thumbnails at a time and the viewer can
     only page through loaded ones, so Next turns off at item 10 until the grid is
     scrolled (fleet: 546 listings stopped at exactly 10 of 22-40). Scroll it and wait
-    for Next to come back; False = the real end of the gallery."""
-    if not await page.evaluate(_SCROLL_GRID):
+    for more thumbs or Next back on; False = the real end of the gallery."""
+    n = await page.evaluate(_SCROLL_GRID)
+    if not n:
         return False
-    for _ in range(8):
-        await page.wait_for_timeout(500)
-        if not await page.evaluate(_NEXT_DISABLED):
-            return True
-    return False
+    return await _wait_js(page, _GROWN, n, min(LAZY_TIMEOUT_MS, timeout_ms))
 
 
-def _photo_key(href: str) -> str:
-    """The viewer URL carries the current item's id (`!1s<id>`); it changes on
-    every Next whether or not the image comes over the network."""
-    m = re.search(r"!1s([^!]+)", href or "")
-    return m.group(1) if m else (href or "")
+def _classify(s: dict) -> dict:
+    """Ready snapshot -> item fields. Video: caption prefix. 360: Photo caption with
+    '360' or a streetviewpixels image. Street View: no Photo/Video caption."""
+    cap, src = s.get("caption"), s.get("img_src")
+    sv_img = bool(src and "streetviewpixels" in src)
+    it = {"url": src, "caption": cap, "viewer_key": s.get("viewer_url_key"), "pano_url": None}
+    if cap and cap.lower().startswith("video"):
+        it.update(kind="video", url=None)
+    elif cap and ("360" in cap or sv_img):
+        it["kind"] = "360"
+    elif not cap:
+        it.update(kind="street_view", caption=s.get("attr"), pano_url=s.get("href"))
+    else:
+        it["kind"] = "photo"
+    return it
 
 
-async def _walk_viewer(page, sniffed: list[str], cap_items: int) -> list[dict]:
-    """Walk the open gallery viewer, one dict per item: {url, date, kind}.
-    cap_items=0 walks to the end: Next disabled is the end of the gallery.
+_UNKNOWN = {"kind": "unknown", "url": None, "caption": None, "viewer_key": None, "pano_url": None}
 
-    Item identity is the viewer URL, not the sniffed image URL. Sniff-based
-    identity stalled when images arrived late (or not at all): two same-month
-    captions then looked identical and the walk stopped at ~10 of 29."""
+
+async def _walk_viewer(page, cur: dict | None, *, photo_cap: int, max_items: int,
+                       deadline: float) -> tuple[list[dict], dict]:
+    """Walk the open viewer from `cur` (the ready snapshot of the shown item, None =
+    it timed out). Returns items and {limits_hit, unknown, photos}. Ends on: the real
+    end of the gallery, a wrap to a seen key, or a limit (§5)."""
     items: list[dict] = []
     seen: set[str] = set()
-    stale = 0
-    # The first item can render late (a Street View canvas draws its "Image
-    # capture" caption after the viewer opens). Reading too early saw nothing,
-    # pressed Next into an empty panorama and gave up with zero items.
-    for _ in range(8):
-        got = await page.evaluate(_EVAL_CURRENT_ITEM)
-        if got.get("img") or got.get("cap") or got.get("attr") or sniffed:
-            break
-        await page.wait_for_timeout(500)
-    n_sniff_used = 0
-    for _ in range(cap_items * 2 if cap_items else _WALK_GUARD):
-        got = await page.evaluate(_EVAL_CURRENT_ITEM)
-        key = _photo_key(page.url)
-        src, cap, attr = got.get("img"), got.get("cap"), got.get("attr")
-        if not src and len(sniffed) > n_sniff_used:
-            src = sniffed[-1]           # only an image that arrived for THIS step
-        n_sniff_used = len(sniffed)
-        is_video = bool(cap and cap.lower().startswith("video"))
-        if is_video:
-            src = None
-        sig = f"{key}|{cap}|{got.get('vid')}"
-        if sig in seen:
-            stale += 1
-            if stale >= 3:
-                break
+    hit: list[str] = []
+    photos = unknown = 0
+    while True:
+        if cur is None:
+            items.append(dict(_UNKNOWN))
+            unknown += 1
         else:
-            seen.add(sig)
-            stale = 0
-            if is_video:
-                items.append({"url": None, "date": cap, "kind": "video"})
-            elif cap:
-                is_sv = bool(src and "streetviewpixels" in src)
-                items.append({"url": src, "date": cap,
-                              "kind": "street_view" if is_sv else "photo"})
-            elif src:
-                is_sv = "streetviewpixels" in src or bool(attr)
-                items.append({"url": src, "date": attr,
-                              "kind": "street_view" if is_sv else "photo"})
-            elif attr:
-                # Street View item with no <img>: either the cover of a listing with
-                # no photo gallery (no Next -> stop below) or the last gallery item.
-                items.append({"url": None, "date": attr, "kind": "street_view"})
-        if cap_items and len(items) >= cap_items:
-            break
-        if await page.evaluate(_NEXT_DISABLED) and not await _load_more(page):
-            break
+            if cur["viewer_url_key"] in seen:
+                break
+            seen.add(cur["viewer_url_key"])
+            it = _classify(cur)
+            items.append(it)
+            photos += it["kind"] == "photo"
         if not await page.locator('button[aria-label*="Next" i]').count():
             break    # a lone Street View panorama: arrow keys move the camera
-        n_before, key_before = len(sniffed), key
-        await _click_next(page)
-        # Wait up to ~8 s for the viewer to move. On slow fleet runners 3 s was not
-        # enough: the unchanged URL read as a repeat, 3 repeats ended the walk early
-        # (Forever Living: 26 in the grid, fleet walked 9) and re-clicking Next while
-        # the last slide was still loading skipped items. Fast loads still break at once.
-        for _ in range(26):
-            await page.wait_for_timeout(300)
-            if _photo_key(page.url) != key_before or len(sniffed) > n_before:
-                break
+        if await page.evaluate(_NEXT_DISABLED) and \
+                not await _load_more(page, _ms_left(deadline, LAZY_TIMEOUT_MS)):
+            if time.monotonic() >= deadline:
+                hit.append("max_s")      # the lazy load ran out of walk time
+            break
+        if photo_cap and photos >= photo_cap:
+            hit.append("photo_cap")
+            break
+        if len(items) >= max_items:
+            hit.append("max_items")
+            break
+        if time.monotonic() >= deadline:
+            hit.append("max_s")
+            break
+        prev = await _snap(page)
+        await _click_next(page, _ms_left(deadline, 3_000))
+        cur = await _wait_item(page, prev, _ms_left(deadline, ITEM_TIMEOUT_MS))
+        if cur is None and time.monotonic() >= deadline:
+            items.append(dict(_UNKNOWN))     # the failed step still counts (item_timeout)
+            unknown += 1
+            hit.append("max_s")
+            break
+    return items, {"limits_hit": hit, "unknown": unknown, "photos": photos}
+
+
+async def _list_gallery_chips(page, before: set[str] = frozenset()) -> list[str]:
+    """Visible tab labels that appeared with the gallery (panel tabs excluded)."""
+    return [lbl for lbl, _ in await page.evaluate(_TABS) if lbl and lbl not in before]
+
+
+async def _walk_tab(page, label: str | None, photo_cap: int, max_items: int, max_s: int,
+                    first_click: bool = False, entry: dict | None = None
+                    ) -> tuple[list[dict], dict] | None:
+    """Select chip `label` (None = walk the stream already shown), wait for chip
+    readiness (§9.1), walk it. None = the chip click failed or chip readiness timed
+    out (walk skipped). `entry` = the ready snapshot of the item shown on gallery
+    entry (None = the entry wait timed out); it is the first item when no chip is
+    clicked, so a failed entry wait gives an unknown first item, never stale content."""
+    t0 = time.monotonic()
+    deadline = t0 + max_s
+    prev = await _snap(page)
+    need_change = False
+    if label is not None:
+        g0 = await page.evaluate(_GRID)
+        tabs = dict(await page.evaluate(_TABS))
+        # The first chip may already be the open stream (All on entry): its keys can
+        # not change, so only grid stability is checked then (never aria alone).
+        need_change = not (first_click and tabs.get(label))
+        await page.evaluate("() => { window.__psChip = null; }")
+        try:
+            if need_change:   # intercepted / timed-out click = chip unavailable, not a crash
+                await page.get_by_role("tab", name=label, exact=True).first.click(
+                    timeout=_ms_left(deadline, 3_000))
+            h = await page.wait_for_function(
+                _CHIP_READY, arg={"prev": json.dumps(g0["keys"]), "need_change": need_change},
+                polling=50, timeout=_ms_left(deadline, CHIP_TIMEOUT_MS))
+            grid = await h.json_value()
+        except Exception:
+            return None
+        if not grid["count"]:       # ok-empty: the chip really has no items
+            return [], {"limits_hit": [], "unknown": 0, "photos": 0,
+                        "ms": int((time.monotonic() - t0) * 1000)}
+        prev = {**prev, "grid0": grid["keys"][0]}
+    cur = await _wait_item(page, prev, _ms_left(deadline, ITEM_TIMEOUT_MS)) if need_change else entry
+    items, meta = await _walk_viewer(page, cur, photo_cap=photo_cap, max_items=max_items,
+                                     deadline=deadline)
+    meta["ms"] = int((time.monotonic() - t0) * 1000)
+    return items, meta
+
+
+def _new_walk_meta(entry: str | None) -> dict:
+    return {"walk_ok": False, "reason": None, "owner_count": 0, "owner_count_known": False,
+            "truncated": 0, "limits_hit": [], "truncated_reasons": [], "chip_unavailable": 0,
+            "latest_ordered": None, "video_count": 0, "pano_count": 0, "unknown_count": 0,
+            "chips_seen": [], "timings": {}, "entry": entry}
+
+
+async def _walk_gallery(page, chips: list[str], wm: dict, photo_cap: int, max_items: int,
+                        max_s: int, entry: dict | None = None) -> list[dict]:
+    """Owner walk, then Latest (else All) walk (§2, §2.2). Fills `wm`; returns the
+    merged items. Items are keyed by viewer key: an item seen in the owner walk is
+    not added again (owner wins, §2), so a later thumb fetch happens once."""
+    def pick(rx):
+        return next((c for c in chips if re.match(rx, c, re.I)), None)
+
+    owner, latest, allc = pick(r"^By owner"), pick(r"^Latest"), pick(r"^All$")
+    items: list[dict] = []
+    keys: set[str] = set()
+
+    def add(walked, source, chip, meta):
+        wm["timings"][chip or "current"] = meta["ms"]
+        for h in meta["limits_hit"]:
+            if h not in wm["limits_hit"]:
+                wm["limits_hit"].append(h)
+        if meta["unknown"] and "item_timeout" not in wm["truncated_reasons"]:
+            wm["truncated_reasons"].append("item_timeout")
+        for it in walked:
+            k = it["viewer_key"]
+            if k and k in keys:
+                continue
+            if k:
+                keys.add(k)
+            items.append({**it, "source": source, "chip": chip, "ordinal": len(items)})
+
+    clicked = False
+    if owner:
+        res = await _walk_tab(page, owner, OWNER_PHOTO_CAP, max_items, max_s, first_click=True,
+                              entry=entry)
+        clicked = True
+        if res is None:
+            wm["chip_unavailable"] = 1
+        else:
+            add(res[0], "owner", owner, res[1])
+            wm["owner_count"] = res[1]["photos"]
+            wm["owner_count_known"] = not res[1]["limits_hit"] and not res[1]["unknown"]
+    else:
+        # Chips listed without "By owner": no owner photos. No chips at all (the
+        # gallery sometimes renders without them, seen live): owner count unknown.
+        wm["owner_count_known"] = bool(chips)
+    ran = False
+    for chip in (c for c in (latest, allc) if c):
+        res = await _walk_tab(page, chip, photo_cap, max_items, max_s, first_click=not clicked,
+                              entry=entry)
+        clicked = True
+        if res is None:
+            wm["chip_unavailable"] = 1        # skipped Latest falls back to All
+            continue
+        add(res[0], "gallery", chip, res[1])
+        ran = True
+        break
+    if not (owner or latest or allc):
+        # No chips at all (seen live, Oct 2026): the open stream is the gallery.
+        res = await _walk_tab(page, None, photo_cap, max_items, max_s, entry=entry)
+        add(res[0], "gallery", None, res[1])
+        ran = True
+    wm["walk_ok"] = ran
+    if not ran:
+        wm["reason"] = "chip_unavailable"
+    for h in wm["limits_hit"]:
+        wm["truncated_reasons"].append(h)
+    wm["truncated"] = int(bool(wm["truncated_reasons"]))
+    wm["video_count"] = sum(i["kind"] == "video" for i in items)
+    wm["pano_count"] = sum(i["kind"] == "360" for i in items)
+    wm["unknown_count"] = sum(i["kind"] == "unknown" for i in items)
     return items
 
 
 async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT, with_menu: bool = True,
-                         place_photo_cap: int = PLACE_PHOTO_CAP_DEFAULT) -> dict:
+                         place_photo_cap: int = WALK_PHOTO_CAP_DEFAULT,
+                         walk_max_items: int = WALK_MAX_ITEMS_DEFAULT,
+                         walk_max_s: int = WALK_MAX_S_DEFAULT) -> dict:
     """Capture menu/photo/date/imagery data from the place panel currently on
     `page`. Never raises — every section degrades to empty + an errors entry.
 
     with_menu=False skips links + the Menu tab and only walks the place-photo
     gallery (the always-on photo-date capture). Order is unchanged when on:
-    menu first, then the gallery re-entered through the menu thumbs."""
+    menu first, then the gallery re-entered through the menu thumbs.
+    place_photo_cap / walk_max_items / walk_max_s: limits per chip walk (§5).
+    Adds `items` (owner + gallery walks, merged by viewer key) and `walk_meta`."""
     out: dict = {"menu_link": None, "website": None, "menu_photos": [],
-                 "place_photos": [], "imagery": None, "errors": []}
+                 "place_photos": [], "imagery": None, "errors": [], "items": [],
+                 "walk_meta": _new_walk_meta(None)}
     menu_walked = False
 
-    sniffed: list[str] = []
-
-    def _sniff(resp):
-        u = resp.url
-        if "googleusercontent.com" in u:
-            m = re.search(r"=w(\d+)|=s(\d+)", u)
-            if m and int(m.group(1) or m.group(2)) >= 400:
-                sniffed.append(u)
-
-    page.on("response", _sniff)
+    # links from the overview panel
     try:
-        # links from the overview panel
-        try:
-            if not with_menu:
-                raise _Skip
-            el = page.locator('a[data-item-id="menu"]').first
-            if await el.count():
-                out["menu_link"] = await el.get_attribute("href")
-            ws = page.locator('a[data-item-id="authority"]').first
-            if await ws.count():
-                out["website"] = await ws.get_attribute("href")
-        except _Skip:
-            pass
-        except Exception as e:
-            out["errors"].append(f"links: {e}")
+        if not with_menu:
+            raise _Skip
+        el = page.locator('a[data-item-id="menu"]').first
+        if await el.count():
+            out["menu_link"] = await el.get_attribute("href")
+        ws = page.locator('a[data-item-id="authority"]').first
+        if await ws.count():
+            out["website"] = await ws.get_attribute("href")
+    except _Skip:
+        pass
+    except Exception as e:
+        out["errors"].append(f"links: {e}")
 
-        # menu tab: filmstrip srcs + dated walk
-        try:
-            tab = page.get_by_role("tab", name=re.compile("^Menu", re.I)).first
-            if with_menu and await tab.count():
-                await tab.click()
-                await page.wait_for_timeout(2_500)
-                thumbs = page.locator('button[aria-label^="Photo "]')
-                if await thumbs.count():
-                    aria0 = await thumbs.first.get_attribute("aria-label") or ""
-                    m = re.search(r"of (\d+)", aria0)
-                    total = min(int(m.group(1)) if m else await thumbs.count(), photo_cap)
-                    await thumbs.first.click()
-                    menu_walked = True
-                    await page.wait_for_timeout(2_000)
-                    strip = await page.evaluate(_EVAL_STRIP_SRCS)
-                    dates = []
-                    for _ in range(max(total, min(len(strip), photo_cap))):
-                        got = await page.evaluate(_EVAL_CURRENT_ITEM)
-                        dates.append(got.get("cap") or got.get("attr"))
+    # menu tab: filmstrip srcs + dated walk
+    try:
+        tab = page.get_by_role("tab", name=re.compile("^Menu", re.I)).first
+        if with_menu and await tab.count():
+            await tab.click()
+            thumbs = page.locator('button[aria-label^="Photo "]')
+            try:
+                await thumbs.first.wait_for(state="visible", timeout=2_500)
+            except PWTimeout:
+                pass
+            if await thumbs.count():
+                aria0 = await thumbs.first.get_attribute("aria-label") or ""
+                m = re.search(r"of (\d+)", aria0)
+                total = min(int(m.group(1)) if m else await thumbs.count(), photo_cap)
+                prev = await _snap(page)
+                await thumbs.first.click()
+                menu_walked = True
+                cur = await _wait_item(page, prev, 2_000)
+                strip = await page.evaluate(_EVAL_STRIP_SRCS)
+                dates = []
+                n = max(total, min(len(strip), photo_cap))
+                for i in range(n):
+                    dates.append((cur.get("caption") or cur.get("attr")) if cur else None)
+                    if i + 1 < n:
+                        prev = await _snap(page)
                         await _click_next(page)
-                        await page.wait_for_timeout(1_200)
-                    await page.keyboard.press("Escape")
-                    await page.wait_for_timeout(800)
-                    out["menu_photos"] = [
-                        {"url": s, "date": dates[i] if i < len(dates) else None}
-                        for i, s in enumerate(strip[:photo_cap])]
-        except Exception as e:
-            out["errors"].append(f"menu_tab: {e}")
-
-        # place photos: re-enter gallery (menu thumbs if present, else cover)
-        try:
-            entered = False
-            # Menu thumbs only exist after a menu walk; without one, a "Photo "
-            # button on the Reviews pane is a reviewer photo, so go via the cover.
-            thumbs2 = page.locator('button[aria-label^="Photo "]')
-            if menu_walked and await thumbs2.count():
-                await thumbs2.first.click()
-                await page.wait_for_timeout(2_000)
-                entered = True
-                out["entry"] = "menu_thumbs"
-            else:
-                ov = page.get_by_role("tab", name=re.compile("^Overview", re.I)).first
-                # Screenshot capture already leaves the page on Overview, and on the
-                # fleets a pane overlay can intercept the click for the full 30s.
-                if await ov.count() and await ov.get_attribute("aria-selected") != "true":
-                    # In-page click: a pointer click lands on the overlay instead.
-                    await ov.evaluate("e => e.click()")
-                    await page.wait_for_timeout(2_000)
-                # "See photos" opens the FULL gallery (viewer on item 1, Next walks
-                # every photo). The hero image can open a ~10-item preview carousel
-                # instead — Akansha Medical: hero 10, See photos 29. Hero is only the
-                # fallback. Never a bare "Photo of ...": that matches reviewer avatars.
-                see = page.locator("button:has-text('See photos')").first
-                cover = page.locator('button[jsaction*="heroHeaderImage"]').first
-                for name, entry, wait_ms in (("see_photos", see, 3_000), ("hero", cover, 2_500)):
-                    if await entry.count():
-                        await entry.evaluate("e => e.click()")   # overlay-proof, see above
-                        await page.wait_for_timeout(wait_ms)
-                        entered = True
-                        out["entry"] = name   # hero = possible ~10-item preview
-                        break
-            if entered:
-                allchip = page.get_by_role("tab", name=re.compile("^All$", re.I)).first
-                if await allchip.count():
-                    await allchip.click()
-                    await page.wait_for_timeout(2_000)
-                out["place_photos"] = await _walk_viewer(page, sniffed, place_photo_cap)
+                        cur = await _wait_item(page, prev, 1_200)
                 await page.keyboard.press("Escape")
-            real = sum(1 for p in out["place_photos"] if p["kind"] in ("photo", "video"))
-            sv = sum(1 for p in out["place_photos"] if p["kind"] == "street_view")
-            out["imagery"] = ("photos" if real else "street_view_only") \
-                if (real or sv) else "none"
-        except Exception as e:
-            out["errors"].append(f"place_photos: {e}")
-            out["imagery"] = out["imagery"] or "unknown"
-    finally:
-        try:
-            page.remove_listener("response", _sniff)
-        except Exception:
-            pass
+                await _wait_js(page, _VIEWER_CLOSED, timeout_ms=800)
+                out["menu_photos"] = [
+                    {"url": s, "date": dates[i] if i < len(dates) else None}
+                    for i, s in enumerate(strip[:photo_cap])]
+    except Exception as e:
+        out["errors"].append(f"menu_tab: {e}")
+
+    # place photos: enter the gallery (menu thumbs if present, else See photos / hero)
+    wm = out["walk_meta"]
+    try:
+        before = {lbl for lbl, _ in await page.evaluate(_TABS)}
+        pre = await _snap(page)          # key before the viewer opens (§9.1)
+        entered, ceiling = None, 0
+        # Menu thumbs only exist after a menu walk; without one, a "Photo "
+        # button on the Reviews pane is a reviewer photo, so go via the cover.
+        thumbs2 = page.locator('button[aria-label^="Photo "]')
+        if menu_walked and await thumbs2.count():
+            await thumbs2.first.click()
+            entered, ceiling = "menu_thumbs", 2_000
+        else:
+            ov = page.get_by_role("tab", name=re.compile("^Overview", re.I)).first
+            # Screenshot capture already leaves the page on Overview, and on the
+            # fleets a pane overlay can intercept the click for the full 30s.
+            if await ov.count() and await ov.get_attribute("aria-selected") != "true":
+                # In-page click: a pointer click lands on the overlay instead.
+                await ov.evaluate("e => e.click()")
+                await _wait_js(page, _ENTRY_PRESENT, timeout_ms=2_000)
+            # "See photos" opens the FULL gallery (viewer on item 1, Next walks
+            # every photo). The hero image can open a ~10-item preview carousel
+            # instead — Akansha Medical: hero 10, See photos 29. Hero is only the
+            # fallback. Never a bare "Photo of ...": that matches reviewer avatars.
+            see = page.locator("button:has-text('See photos')").first
+            cover = page.locator('button[jsaction*="heroHeaderImage"]').first
+            for name, entry, wait_ms in (("see_photos", see, 3_000), ("hero", cover, 2_500)):
+                if await entry.count():
+                    await entry.evaluate("e => e.click()")   # overlay-proof, see above
+                    entered, ceiling = name, wait_ms   # hero = possible ~10-item preview
+                    break
+        out["entry"] = wm["entry"] = entered
+        if entered:
+            t_entry = time.monotonic() + ceiling / 1000
+            entry = await _wait_item(page, pre, ceiling)   # first item ready; None = unknown
+            await _wait_js(page, _NEW_TABS, sorted(before), _ms_left(t_entry, ceiling))
+            chips = await _list_gallery_chips(page, before)
+            wm["chips_seen"] = chips
+            out["items"] = await _walk_gallery(page, chips, wm, place_photo_cap,
+                                               walk_max_items, walk_max_s, entry)
+            await page.keyboard.press("Escape")
+        else:
+            wm["reason"] = "no_entry"
+        out["place_photos"] = [{"url": i["url"], "date": i["caption"], "kind": i["kind"]}
+                               for i in out["items"]]
+        real = sum(1 for p in out["place_photos"] if p["kind"] in ("photo", "video"))
+        sv = sum(1 for p in out["place_photos"] if p["kind"] == "street_view")
+        out["imagery"] = ("photos" if real else "street_view_only") \
+            if (real or sv) else "none"
+    except Exception as e:
+        out["errors"].append(f"place_photos: {e}")
+        out["imagery"] = out["imagery"] or "unknown"
+        wm["walk_ok"], wm["reason"] = False, "exception"
     return out
+
+
+if __name__ == "__main__":   # self-check of the pure parts: python -m parallel_scraper.horeca_capture
+    base = {"viewer_url_key": "k", "img_src": "https://lh3.googleusercontent.com/p/x=w1",
+            "attr": "Image capture: Jan 2024", "href": "https://maps/x"}
+    assert _classify({**base, "caption": "Photo - Jan 2024"})["kind"] == "photo"
+    assert _classify({**base, "caption": "Video - Jan 2024"}) == {
+        "url": None, "caption": "Video - Jan 2024", "viewer_key": "k", "pano_url": None,
+        "kind": "video"}
+    assert _classify({**base, "caption": "Photo - 360 - Jan 2024"})["kind"] == "360"
+    sv = _classify({**base, "caption": None})
+    assert sv["kind"] == "street_view" and sv["pano_url"] == "https://maps/x" \
+        and sv["caption"] == "Image capture: Jan 2024"
+    assert _ms_left(time.monotonic() + 1, 8_000) <= 1_000 and _ms_left(None, 50) == 50
+    print("ok")

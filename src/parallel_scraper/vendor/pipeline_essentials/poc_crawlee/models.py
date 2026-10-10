@@ -37,6 +37,23 @@ class PlaceData:
     image_urls: str = "N/A"         # semicolon-separated
     image_downloaded: str = "0"     # 0 = not downloaded, 1 = downloaded
 
+    # --- Phase 2 normalised fields (design §8.5, §8.7); raw fields above stay untouched ---
+    observed_at: Optional[str] = None   # UTC ISO, page load time
+    phone_e164: Optional[str] = None
+    website_host: Optional[str] = None
+    rating_num: Optional[float] = None
+    review_count_int: Optional[int] = None
+    price_currency: Optional[str] = None
+    price_min: Optional[float] = None
+    price_max: Optional[float] = None
+    address_postcode: Optional[str] = None
+    address_state: Optional[str] = None
+    category_class: Optional[str] = None
+    latest_review_at_min: Optional[str] = None
+    latest_review_at_max: Optional[str] = None
+    latest_review_granularity: Optional[str] = None
+    latest_review_verified: Optional[int] = None
+
     # --- Metadata ---
     source_url: str = ""
     label: str = ""

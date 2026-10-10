@@ -199,10 +199,18 @@ def _utm_crs_for(lat: float, lon: float) -> str:
 
 def generate_grid(boundary_gdf, grid_size_meters: int, city_prefix: str = "MUM",
                   grid_type: str = "square") -> list[GridCell]:
-    """Reproject to local UTM, build square grid, clip to boundary, return WGS84 cells."""
+    """Reproject to local UTM, build square grid, clip to boundary, return WGS84 cells.
+
+    Fully vectorized (shapely 2 + numpy): a state-sized boundary at a small
+    grid size means millions of candidate cells — a Python per-cell
+    `box().intersects(poly)` loop against an unprepared polygon took minutes
+    and froze the dashboard. This path prepares the polygon once and does the
+    intersects test as one C-level array call.
+    """
     try:
+        import numpy as np
         import geopandas as gpd
-        from shapely.geometry import box
+        import shapely
     except ImportError as e:
         raise RuntimeError(f"geopandas/shapely required: {e}")
 
@@ -216,36 +224,88 @@ def generate_grid(boundary_gdf, grid_size_meters: int, city_prefix: str = "MUM",
     minx, miny, maxx, maxy = bnd_utm.total_bounds
     poly = bnd_utm.geometry.iloc[0]
 
-    cells_utm = []
     nx = int(math.ceil((maxx - minx) / grid_size_meters))
     ny = int(math.ceil((maxy - miny) / grid_size_meters))
-    for ix in range(nx):
-        for iy in range(ny):
-            x0 = minx + ix * grid_size_meters
-            y0 = miny + iy * grid_size_meters
-            cell_box = box(x0, y0, x0 + grid_size_meters, y0 + grid_size_meters)
-            if not cell_box.intersects(poly):
-                continue
-            cells_utm.append(cell_box)
-
-    if not cells_utm:
+    if nx <= 0 or ny <= 0:
+        return []
+    xs = minx + grid_size_meters * np.arange(nx)
+    ys = miny + grid_size_meters * np.arange(ny)
+    gx, gy = np.meshgrid(xs, ys, indexing="ij")
+    x0 = gx.ravel()
+    y0 = gy.ravel()
+    boxes = shapely.box(x0, y0, x0 + grid_size_meters, y0 + grid_size_meters)
+    # Prepared geometry only speeds up predicates where it is the FIRST
+    # argument — intersects(poly, boxes), not intersects(boxes, poly).
+    # Swapping the order is ~14x faster at state scale.
+    shapely.prepare(poly)
+    mask = shapely.intersects(poly, boxes)
+    cells_utm = boxes[mask]
+    if len(cells_utm) == 0:
         return []
 
     gdf_cells = gpd.GeoDataFrame(geometry=cells_utm, crs=bnd_utm.crs).to_crs(epsg=4326)
+    geoms = gdf_cells.geometry.values
+    cents = shapely.centroid(np.asarray(geoms))
+    clon = shapely.get_x(cents)
+    clat = shapely.get_y(cents)
+    bounds = shapely.bounds(np.asarray(geoms))  # (n, 4): west, south, east, north
 
     out: list[GridCell] = []
-    for idx, geom_wgs in enumerate(gdf_cells.geometry):
-        c = geom_wgs.centroid
-        bx_w, bx_s, bx_e, bx_n = geom_wgs.bounds
+    for idx in range(len(geoms)):
+        bx_w, bx_s, bx_e, bx_n = bounds[idx]
         out.append(GridCell(
             cell_id=f"{city_prefix}_{idx:04d}",
-            centroid_lat=float(c.y),
-            centroid_lon=float(c.x),
+            centroid_lat=float(clat[idx]),
+            centroid_lon=float(clon[idx]),
             bbox_north=float(bx_n), bbox_south=float(bx_s),
             bbox_east=float(bx_e), bbox_west=float(bx_w),
         ))
     logger.info("grid.generated cells=%d size_m=%d", len(out), grid_size_meters)
     return out
+
+
+# ─── adaptive (quadtree) subdivision ───────────────────────
+# Child cell ids append "q<quadrant>" to the parent id (q0=SW, q1=SE, q2=NW,
+# q3=NE): "MAH_0012" -> "MAH_0012q3q1". Root ids never contain a lowercase
+# 'q' (prefix is uppercased), so the id alone encodes root + split path —
+# which lets a resume rebuild any child cell's geometry without persisting it.
+
+def split_cell(cell: GridCell) -> list[GridCell]:
+    """Split a cell's bbox into 4 equal quadrant children."""
+    mid_lat = (cell.bbox_south + cell.bbox_north) / 2.0
+    mid_lon = (cell.bbox_west + cell.bbox_east) / 2.0
+    quads = [
+        (cell.bbox_south, mid_lat, cell.bbox_west, mid_lon),   # q0 SW
+        (cell.bbox_south, mid_lat, mid_lon, cell.bbox_east),   # q1 SE
+        (mid_lat, cell.bbox_north, cell.bbox_west, mid_lon),   # q2 NW
+        (mid_lat, cell.bbox_north, mid_lon, cell.bbox_east),   # q3 NE
+    ]
+    return [
+        GridCell(
+            cell_id=f"{cell.cell_id}q{i}",
+            centroid_lat=(s + n) / 2.0,
+            centroid_lon=(w + e) / 2.0,
+            bbox_north=n, bbox_south=s, bbox_east=e, bbox_west=w,
+        )
+        for i, (s, n, w, e) in enumerate(quads)
+    ]
+
+
+def cell_id_root_and_path(cell_id: str) -> tuple[str, list[int]]:
+    """Decompose a (possibly child) cell id into (root_id, quadrant_path)."""
+    parts = cell_id.split("q")
+    try:
+        return parts[0], [int(p) for p in parts[1:]]
+    except ValueError:
+        return cell_id, []
+
+
+def derive_cell(root: GridCell, path: list[int]) -> GridCell:
+    """Rebuild a child GridCell from its root cell + quadrant path."""
+    cell = root
+    for quad in path:
+        cell = split_cell(cell)[quad]
+    return cell
 
 
 def grid_to_geojson(cells: list[GridCell]) -> dict:

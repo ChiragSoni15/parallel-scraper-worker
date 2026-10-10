@@ -101,6 +101,15 @@ class Stats:
             self.queries_total = max(0, int(queries_total or 0))
             self.cells_done = max(self.cells_done, int(cells_done or 0))
 
+    def add_phase1_cells(self, n: int) -> None:
+        """Grow the Phase-1 task total mid-run (adaptive-grid subdivision adds
+        child (cell, query) tasks). grid_cells_total stays at the root grid
+        count — it must keep matching grid.geojson for the dashboard map."""
+        if n <= 0:
+            return
+        with self._lock:
+            self.cells_total += int(n)
+
     def record_cell_started(self) -> None:
         with self._lock:
             self.cells_in_flight += 1

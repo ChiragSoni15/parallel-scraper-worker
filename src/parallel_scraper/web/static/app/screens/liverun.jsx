@@ -125,6 +125,11 @@ function ResumeDialog({ runId, snap, onClose }) {
         osm_type: snap?.osm_type || "relation",
         city: snap?.city || "area",
         grid_size_meters: snap?.grid_size_meters || 250,
+        // Must match the original run: dropping the adaptive flag on resume
+        // would regenerate root cells at the floor size with different ids,
+        // orphaning all done-cell state.
+        adaptive_grid: !!snap?.adaptive_grid,
+        adaptive_coarse_meters: snap?.adaptive_coarse_meters || 4000,
         queries: queries.join(","),
         discovery_backend: snap?.discovery_backend || "places_api",
         places_tier: snap?.places_tier || "ESSENTIALS",

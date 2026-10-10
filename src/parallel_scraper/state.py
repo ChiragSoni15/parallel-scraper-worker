@@ -169,6 +169,27 @@ class StateBuffer:
             self._dirty_cells = True
         self._tick()
 
+    def cells_add_pending(self, cell_id: str, query: str) -> None:
+        """Register a (cell, query) as pending work WITHOUT touching an existing
+        row. Used by adaptive-grid subdivision to durably record child cells
+        before the parent is marked done — so a crash between the two can't
+        lose the children. A child that already ran (any status) is left alone."""
+        key = (cell_id, query)
+        with self._cells_lock:
+            if key in self._cells:
+                return
+            self._cells[key] = {
+                "cell_id": cell_id, "query": query, "status": "pending",
+                "last_attempted_at": "", "place_count": "0", "error_msg": "",
+            }
+            self._dirty_cells = True
+        self._tick()
+
+    def cells_all(self) -> list[dict]:
+        """Snapshot of every cell-state row (resume scan)."""
+        with self._cells_lock:
+            return [dict(v) for v in self._cells.values()]
+
     def get_done_cell_keys(self) -> set[tuple[str, str]]:
         with self._cells_lock:
             return {k for k, v in self._cells.items() if v.get("status") == "done"}
@@ -307,8 +328,18 @@ class StateBuffer:
 
         self._writes_since_flush = 0
 
+    def _current_flush_interval(self) -> float:
+        """Scale the flush cadence with state size. flush() rewrites the WHOLE
+        CSV, so at state-scale runs (1M+ rows) a fixed 3s cadence means
+        near-continuous serialization + hundreds of GB of cumulative writes.
+        Base cadence up to ~60K rows, then ~1s per extra 20K rows, capped at
+        60s. The crash window grows accordingly — resume just re-attempts the
+        cells/placeids from that window, which is correct behavior."""
+        rows = len(self._cells) + len(self._placeids)  # racy read; sizing only
+        return min(60.0, max(self._flush_seconds, rows / 20_000))
+
     def _flusher_loop(self) -> None:
-        while not self._stop_event.wait(timeout=self._flush_seconds):
+        while not self._stop_event.wait(timeout=self._current_flush_interval()):
             try:
                 self.flush()
             except Exception:

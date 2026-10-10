@@ -331,6 +331,8 @@ class ParallelScraper:
             "osm_type": self._config.osm_type,
             "city_name": self._config.city_name,
             "grid_size_meters": self._config.grid_size_meters,
+            "adaptive_grid": self._config.adaptive_grid,
+            "adaptive_coarse_meters": self._config.adaptive_coarse_meters,
             "queries": list(self._config.queries),
             "discovery_backend": self._config.discovery_backend,
             "places_tier": self._config.places_tier,

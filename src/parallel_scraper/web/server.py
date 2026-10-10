@@ -17,13 +17,14 @@ import csv
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -61,6 +62,10 @@ class StartRunBody(BaseModel):
     osm_type: str = "relation"
     city: str = "Mumbai"
     grid_size_meters: int = 1000
+    # Quadtree discovery: start coarse, subdivide saturated cells down to
+    # grid_size_meters (Phase-1 places_api backend only).
+    adaptive_grid: bool = False
+    adaptive_coarse_meters: int = 4000
     queries: str = "shops"
     discovery_backend: str = "places_api"
     places_tier: str = "ESSENTIALS"
@@ -107,6 +112,9 @@ class StartRunBody(BaseModel):
             # Web-launched runs use a fast heartbeat so worker pills + cost feel live.
             "--heartbeat-interval-s", "2",
         ]
+        if self.adaptive_grid:
+            args += ["--adaptive-grid",
+                     "--adaptive-coarse-meters", str(max(1, int(self.adaptive_coarse_meters)))]
         if polygon_file:
             args += ["--polygon-file", polygon_file]
         if self.max_places is not None:
@@ -154,6 +162,26 @@ class SavePresetBody(BaseModel):
 
 PRESETS_PATH = Path(os.environ.get("PARALLEL_SCRAPER_PRESETS_PATH",
                                    "inputs/query_presets.json"))
+
+# Run queue: boundaries + query sets saved from the New Run screen, launched
+# sequentially by a background scheduler thread whenever no run is active.
+QUEUE_PATH = Path(os.environ.get("PARALLEL_SCRAPER_QUEUE_PATH",
+                                 "inputs/run_queue.json"))
+_QUEUE_LOCK = threading.Lock()
+
+
+def _queue_load() -> list[dict]:
+    try:
+        return json.loads(QUEUE_PATH.read_text(encoding="utf-8")).get("items", [])
+    except Exception:
+        return []
+
+
+def _queue_save(items: list[dict]) -> None:
+    QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = QUEUE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"items": items}, indent=1), encoding="utf-8")
+    tmp.replace(QUEUE_PATH)
 
 
 # ─── helpers ──────────────────────────────────────────────
@@ -547,12 +575,21 @@ def _path_signature(path: Path) -> tuple[int, int]:
         return 0, 0
 
 
+_TOUCHED_STATE_TTL_S = 10.0
+
+
 def _read_touched_cell_states_cached(run_dir: Path) -> dict[str, dict]:
     scells = run_dir / "state_cells.csv"
     sig = _path_signature(scells)
     cache_key = str(scells.resolve())
     cached = _TOUCHED_GRID_CACHE.get(cache_key)
     if cached and cached.get("state_sig") == sig and "states" in cached:
+        return cached["states"]
+    # state_cells.csv is rewritten wholesale every few seconds by a live run,
+    # so the mtime check alone re-parses it on every poll (0.6 s at 13 MB,
+    # 3 s at 50 MB). A short TTL caps that at one parse per 10 s regardless
+    # of how many tabs are polling.
+    if cached and "states" in cached and time.time() - cached.get("parsed_at", 0) < _TOUCHED_STATE_TTL_S:
         return cached["states"]
 
     out: dict[str, dict] = {}
@@ -576,7 +613,7 @@ def _read_touched_cell_states_cached(run_dir: Path) -> dict[str, dict]:
             logger.debug("grid.touched_state_read_failed run_dir=%s", run_dir, exc_info=True)
 
     cached = dict(cached or {})
-    cached.update({"state_sig": sig, "states": out})
+    cached.update({"state_sig": sig, "states": out, "parsed_at": time.time()})
     _TOUCHED_GRID_CACHE[cache_key] = cached
     return out
 
@@ -598,15 +635,17 @@ def _grid_feature_index_cached(gpath: Path) -> dict:
         "grid_sig": sig,
         "feature_count": len(features),
         "by_id": by_id,
+        "body": json.dumps(gj, separators=(",", ":")).encode("utf-8"),
     }
     _GRID_INDEX_CACHE[cache_key] = cached
     return cached
 
 
 def _touched_grid_payload_cached(run_dir: Path, gpath: Path) -> dict:
+    """Returns {body: bytes, etag: str} for the touched-cells FeatureCollection."""
     states = _read_touched_cell_states_cached(run_dir)
     if not states:
-        return {"type": "FeatureCollection", "features": []}
+        return {"body": b'{"type":"FeatureCollection","features":[]}', "etag": '"empty"'}
 
     grid_index = _grid_feature_index_cached(gpath)
     cache_key = f"{run_dir.resolve()}::payload"
@@ -614,7 +653,7 @@ def _touched_grid_payload_cached(run_dir: Path, gpath: Path) -> dict:
     grid_sig = grid_index.get("grid_sig")
     cached = _TOUCHED_GRID_CACHE.get(cache_key)
     if cached and cached.get("state_sig") == state_sig and cached.get("grid_sig") == grid_sig:
-        return cached["payload"]
+        return cached
 
     by_id = grid_index.get("by_id") or {}
     filtered = []
@@ -634,8 +673,13 @@ def _touched_grid_payload_cached(run_dir: Path, gpath: Path) -> dict:
         "state_sig": state_sig,
         "grid_sig": grid_sig,
         "payload": payload,
+        # Serialize once: a state-sized run is ~7 MB / 0.3 s of json.dumps
+        # per poll otherwise. The etag lets the browser skip the download
+        # entirely when state_cells.csv hasn't changed.
+        "body": json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        "etag": f'"{state_sig[0]}-{state_sig[1]}-{grid_sig[0] if grid_sig else 0}"',
     }
-    return payload
+    return _TOUCHED_GRID_CACHE[cache_key]
 
 
 def _truncate_in_place(path: Path) -> bool:
@@ -687,6 +731,8 @@ def _live_summary_base(run_dir: Path, registry: RunRegistry, *, include_arrays: 
         "osm_relation_id": cfg.get("osm_relation_id"),
         "osm_type": cfg.get("osm_type", "relation"),
         "grid_size_meters": cfg.get("grid_size_meters", 250),
+        "adaptive_grid": bool(cfg.get("adaptive_grid", False)),
+        "adaptive_coarse_meters": cfg.get("adaptive_coarse_meters", 4000),
         "num_consumer_threads": cfg.get("num_consumer_threads", 8),
         "discovery_backend": cfg.get("discovery_backend", "places_api"),
         "places_tier": cfg.get("places_tier", "ESSENTIALS"),
@@ -787,6 +833,8 @@ def _summarize_run(run_dir: Path, registry: RunRegistry) -> dict:
         "osm_relation_id": cfg.get("osm_relation_id"),
         "osm_type": cfg.get("osm_type", "relation"),
         "grid_size_meters": cfg.get("grid_size_meters", 250),
+        "adaptive_grid": bool(cfg.get("adaptive_grid", False)),
+        "adaptive_coarse_meters": cfg.get("adaptive_coarse_meters", 4000),
         "num_consumer_threads": cfg.get("num_consumer_threads", 8),
         "discovery_backend": cfg.get("discovery_backend", "places_api"),
         "places_tier": cfg.get("places_tier", "ESSENTIALS"),
@@ -825,6 +873,9 @@ def _list_run_dirs() -> list[Path]:
 def create_app() -> FastAPI:
     app = FastAPI(title="parallel-scraper", docs_url=None, redoc_url=None)
     registry = RunRegistry()
+    # geopandas/shapely import costs ~1.7 s cold; pay it now, not on the first upload.
+    threading.Thread(target=lambda: __import__("parallel_scraper.boundary"), daemon=True).start()
+    threading.Thread(target=lambda: __import__("geopandas"), daemon=True).start()
     app.state.registry = registry
 
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
@@ -832,12 +883,19 @@ def create_app() -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request):
-        return HTMLResponse(_dashboard_html, headers={"cache-control": "no-store"})
+        # Re-read per request (20 KB): asset version bumps in the template
+        # take effect without a server restart.
+        return HTMLResponse((_TEMPLATES_DIR / "dashboard.html").read_text(encoding="utf-8"),
+                            headers={"cache-control": "no-store"})
 
     # ─── grid-scraper UX endpoints ───────────────────────
 
+    # NOTE: search-city and generate-grid are sync `def` on purpose — FastAPI
+    # runs them in its threadpool. Both block (Nominatim HTTP / heavy geometry
+    # work); as `async def` they froze the event loop and with it every other
+    # request, which read as "the screen freezes" for large states.
     @app.post("/api/grid-scraper/search-city")
-    async def search_city_route(body: SearchCityBody):
+    def search_city_route(body: SearchCityBody):
         from parallel_scraper.boundary import search_city
         try:
             cands = search_city(body.query.strip(), limit=8)
@@ -857,7 +915,7 @@ def create_app() -> FastAPI:
         ]}
 
     @app.post("/api/grid-scraper/generate-grid")
-    async def generate_grid_route(body: GenerateGridBody):
+    def generate_grid_route(body: GenerateGridBody):
         from parallel_scraper.boundary import (
             boundary_from_polygon, boundary_to_geojson,
             fetch_boundary, generate_grid, grid_to_geojson,
@@ -888,9 +946,19 @@ def create_app() -> FastAPI:
             logger.exception("generate_grid failed")
             raise HTTPException(500, f"grid generation failed: {e}")
 
+        # Preview-payload cap: the map never renders more than ~5K cells
+        # anyway (LARGE_GRID_THRESHOLD in map.jsx), but a state-sized area at
+        # a small grid size can be >1M cells — hundreds of MB of GeoJSON that
+        # froze the browser on JSON.parse alone. Sample evenly so the preview
+        # still shows coverage; total_cells stays exact. The real run
+        # regenerates the full grid server-side, so nothing is lost.
+        preview_cap = 4000
+        sampled = len(cells) > preview_cap
+        preview_cells = cells[::max(1, -(-len(cells) // preview_cap))] if sampled else cells
         return {
             "boundary_geojson": boundary_to_geojson(boundary),
-            "grid_geojson": grid_to_geojson(cells),
+            "grid_geojson": grid_to_geojson(preview_cells),
+            "grid_preview_sampled": sampled,
             "total_cells": len(cells),
             "city_display_name": display_name,
         }
@@ -1051,7 +1119,7 @@ def create_app() -> FastAPI:
         return _read_api_key_inventory()
 
     @app.get("/api/runs/{run_id}/boundary")
-    async def get_run_boundary(run_id: str):
+    def get_run_boundary(run_id: str):
         """Return the area outline (Polygon/MultiPolygon FeatureCollection)
         so the dashboard can show the scrape boundary on the map.
 
@@ -1110,7 +1178,7 @@ def create_app() -> FastAPI:
         return JSONResponse(payload)
 
     @app.get("/api/runs/{run_id}/grid")
-    async def get_run_grid(run_id: str, mode: str = "full"):
+    def get_run_grid(request: Request, run_id: str, mode: str = "full"):
         """Serve the grid GeoJSON.
 
         mode=full (default): the full FeatureCollection. Fine for small grids.
@@ -1137,7 +1205,11 @@ def create_app() -> FastAPI:
                 raise HTTPException(500, f"grid read failed: {e}")
 
         if mode == "touched":
-            return JSONResponse(_touched_grid_payload_cached(run_dir, gpath))
+            t = _touched_grid_payload_cached(run_dir, gpath)
+            if request.headers.get("if-none-match") == t["etag"]:
+                return Response(status_code=304, headers={"etag": t["etag"]})
+            return Response(content=t["body"], media_type="application/json",
+                            headers={"etag": t["etag"]})
             # Read state_cells.csv first — small file even for MMR (~few MB).
             scells = run_dir / "state_cells.csv"
             touched_ids: set[str] = set()
@@ -1161,8 +1233,9 @@ def create_app() -> FastAPI:
             ]
             return JSONResponse({"type": "FeatureCollection", "features": filtered})
 
-        # full
-        return JSONResponse(json.loads(gpath.read_text(encoding="utf-8")))
+        # full — served from the parsed-grid cache (keyed by file mtime/size)
+        idx = _grid_feature_index_cached(gpath)
+        return Response(content=idx["body"], media_type="application/json")
 
     @app.get("/api/runs/{run_id}/logs")
     async def get_run_logs(run_id: str, n: int = 200):
@@ -1243,8 +1316,8 @@ def create_app() -> FastAPI:
                                  headers={"cache-control": "no-cache",
                                           "x-accel-buffering": "no"})
 
-    @app.post("/api/runs")
-    async def start_run(body: StartRunBody):
+    def _launch(body: StartRunBody) -> dict:
+        # Shared by the /api/runs endpoint and the queue scheduler.
         # Server-side sanitize: the run_id becomes a filesystem directory under
         # OUTPUT_DIR, so anything outside [A-Za-z0-9_-] is collapsed to "_".
         # Defense in depth — the frontend already sanitizes, but a direct POST
@@ -1283,6 +1356,118 @@ def create_app() -> FastAPI:
         args = body_with_id.to_cli_args(str(OUTPUT_DIR), polygon_file=polygon_file)
         managed = registry.start(run_id, args, cwd=Path.cwd())
         return {"run_id": run_id, "pid": managed.pid, "cmd": managed.cmd}
+
+    @app.post("/api/runs")
+    async def start_run(body: StartRunBody):
+        return _launch(body)
+
+    # ─── run queue (JSON-backed, processed sequentially) ──
+
+    @app.get("/api/queue")
+    def queue_list():
+        with _QUEUE_LOCK:
+            return {"items": _queue_load()}
+
+    @app.post("/api/queue")
+    def queue_add(body: StartRunBody):
+        import uuid
+        item = {
+            "id": uuid.uuid4().hex[:8],
+            "added_at": datetime.now(timezone.utc).isoformat(),
+            "status": "queued",
+            "run_id": body.run_id or None,
+            "label": body.city or "area",
+            "queries": body.queries,
+            "grid_size_meters": body.grid_size_meters,
+            "body": body.model_dump(),
+        }
+        with _QUEUE_LOCK:
+            items = _queue_load()
+            items.append(item)
+            _queue_save(items)
+        return item
+
+    @app.delete("/api/queue/{item_id}")
+    def queue_remove(item_id: str):
+        with _QUEUE_LOCK:
+            items = _queue_load()
+            match = next((i for i in items if i.get("id") == item_id), None)
+            if match is None:
+                raise HTTPException(404, "no queue item with that id")
+            if match.get("status") == "running":
+                raise HTTPException(409, "item is running; stop the run instead")
+            _queue_save([i for i in items if i.get("id") != item_id])
+        return {"removed": item_id}
+
+    def _queue_set(item_id: str, **updates) -> None:
+        with _QUEUE_LOCK:
+            items = _queue_load()
+            for it in items:
+                if it.get("id") == item_id:
+                    it.update(updates)
+            _queue_save(items)
+
+    def _queue_tick() -> None:
+        """One scheduler pass: reconcile running items, launch the next one."""
+        launch_item = None
+        with _QUEUE_LOCK:
+            items = _queue_load()
+            changed = False
+            for it in items:
+                if it.get("status") != "running":
+                    continue
+                m = registry.get(it.get("run_id") or "")
+                if m is None:
+                    it["status"] = "queued"
+                    changed = True
+                elif m.exit_code is not None:
+                    it["status"] = "done" if m.exit_code == 0 else "failed"
+                    it["exit_code"] = m.exit_code
+                    changed = True
+            # Sequential: launch the next queued item only when NOTHING is
+            # active — including manually-started runs.
+            busy = any(it.get("status") == "running" for it in items) or registry.list_active()
+            if not busy:
+                launch_item = next((it for it in items if it.get("status") == "queued"), None)
+                if launch_item:
+                    launch_item["status"] = "running"  # claim inside the lock
+                    changed = True
+            if changed:
+                _queue_save(items)
+        if not launch_item:
+            return
+        try:
+            body = StartRunBody(**(launch_item.get("body") or {}))
+            if launch_item.get("run_id"):
+                body = body.model_copy(update={"run_id": launch_item["run_id"]})
+            res = _launch(body)
+            _queue_set(launch_item["id"], run_id=res["run_id"])
+            logger.info("queue.launched item=%s run_id=%s", launch_item["id"], res["run_id"])
+        except Exception as e:
+            logger.exception("queue.launch_failed item=%s", launch_item.get("id"))
+            _queue_set(launch_item["id"], status="failed", error=str(e))
+
+    app.state.queue_tick = _queue_tick  # exposed for tests
+
+    def _queue_scheduler() -> None:
+        # Items left 'running' by a previous server process go back to
+        # 'queued'; relaunching with the stored run_id resumes from on-disk
+        # state, so a re-launch is safe.
+        with _QUEUE_LOCK:
+            items = _queue_load()
+            stale = [it for it in items if it.get("status") == "running"]
+            for it in stale:
+                it["status"] = "queued"
+            if stale:
+                _queue_save(items)
+        while True:
+            time.sleep(5)
+            try:
+                _queue_tick()
+            except Exception:
+                logger.exception("queue.scheduler_tick_failed")
+
+    threading.Thread(target=_queue_scheduler, daemon=True, name="queue-scheduler").start()
 
     @app.post("/api/runs/{run_id}/stop")
     async def stop_run(run_id: str):
