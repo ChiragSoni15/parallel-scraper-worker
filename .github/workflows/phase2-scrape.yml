@@ -152,6 +152,14 @@ jobs:
         run: python -m playwright install-deps chromium
       - name: Playwright marker
         run: echo "STARTUP t_playwright=$(date +%s)"
+      - name: Resource sampler (cores, memory every 30 s)
+        run: |
+          echo "RESOURCES cores=$(nproc) mem_total_mb=$(free -m | awk '/Mem:/{print $2}')"
+          ( while true; do
+              echo "RESOURCES t=$(date +%s) mem_used_mb=$(free -m | awk '/Mem:/{print $3}') mem_avail_mb=$(free -m | awk '/Mem:/{print $7}') load1=$(cut -d' ' -f1 /proc/loadavg) chromium_rss_mb=$(ps -eo rss,comm | awk '/chrom/{s+=$1} END{printf "%d", s/1024}') chromium_procs=$(ps -eo comm | grep -c chrom)"
+              sleep 30
+            done ) &
+          echo $! > /tmp/sampler.pid
       - name: Scrape (API mode)
         env:
           WORKER_API_BASE: ${{ vars.WORKER_API_BASE }}
