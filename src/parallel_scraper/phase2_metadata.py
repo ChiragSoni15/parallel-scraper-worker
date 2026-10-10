@@ -310,6 +310,12 @@ def scrape_one(
 # Below this many seconds of walk budget left, a degraded page is not retried.
 DEGRADED_RETRY_MIN_S = 10
 
+_CONTEXT_KW = dict(
+    viewport={"width": 1920, "height": 1080},
+    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    extra_http_headers={"accept-language": "en-IN,en;q=0.9"},
+)
+
 
 class PlaywrightSession:
     """Long-lived Playwright browser + page held by a Phase-2 consumer thread.
@@ -342,6 +348,10 @@ class PlaywrightSession:
         self._browser = None
         self._context = None
         self._page = None
+        # Cookies of the last full (non-degraded) place page. The degraded render is
+        # bound to the cookie jar: a new context seeded with these renders full, a
+        # cleared jar or an unseeded context without warm-up does not (degraded2 matrix).
+        self._good_cookies: list[dict] = []
         # asyncio.Lock must be created inside the loop it runs on
         self._csv_lock = self._loop.run_until_complete(self._make_lock())
         self.places_scraped = 0
@@ -361,11 +371,9 @@ class PlaywrightSession:
                 headless=True,
                 args=["--disable-dev-shm-usage", "--disable-gpu"],
             )
-            self._context = await self._browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                extra_http_headers={"accept-language": "en-IN,en;q=0.9"},
-            )
+            self._context = await self._browser.new_context(**_CONTEXT_KW)
+            if self._good_cookies:
+                await self._context.add_cookies(self._good_cookies)
             self._page = await self._context.new_page()
             # Warm the session: visiting maps.google.com once before scraping
             # individual place URLs causes Google to plant the cookies
@@ -435,6 +443,46 @@ class PlaywrightSession:
                            exc_info=True)
             self._close_browser()
             self._open_browser()
+
+    async def _remember_good(self) -> None:
+        try:
+            self._good_cookies = await self._context.cookies()
+        except Exception:
+            pass
+
+    async def _seeded_context(self) -> None:
+        """Replace the context with a new one seeded with the good cookies (~0.1 s,
+        no warm-up: the seed is what unlocks the full page)."""
+        old = self._context
+        self._context = await self._browser.new_context(**_CONTEXT_KW)
+        await self._context.add_cookies(self._good_cookies)
+        self._page = await self._context.new_page()
+        try:
+            await old.close()
+        except Exception:
+            pass
+
+    def _recover_degraded(self, reload_and_check) -> tuple[str, object]:
+        """Get a full page back after a degraded render. `reload_and_check` is an async
+        fn that re-opens the place and returns (full, result). A new context seeded with
+        the good cookies first (when there are any), then, if still degraded, a browser
+        relaunch (~20 s, ~half recover). Returns (method of the last attempt, its result)."""
+        if self._good_cookies and self._browser is not None:
+            try:
+                self._loop.run_until_complete(self._seeded_context())
+                full, res = self._loop.run_until_complete(reload_and_check())
+                if full:
+                    return "cookie_context", res
+            except Exception:
+                logger.warning("phase2_session.cookie_context_failed", exc_info=True)
+            # These cookies did not unlock the page: relaunch unseeded (a fresh draw).
+            self._good_cookies = []
+        self._close_browser()
+        self._open_browser()
+        full, res = self._loop.run_until_complete(reload_and_check())
+        if full:
+            self._loop.run_until_complete(self._remember_good())
+        return "relaunch", res
 
     def recycle(self) -> None:
         """Recycle between scrape batches. Page-only by default (fast, keeps
@@ -532,15 +580,20 @@ class PlaywrightSession:
             return await capture_panel_extras(self._page, want_menu=want_menu,
                                               want_about=want_about)
 
+        async def _retry() -> tuple[bool, dict]:
+            ex = await _do()
+            return not ex.get("degraded"), ex
+
         try:
             ex = self._loop.run_until_complete(_do())
             if ex.get("degraded"):
-                # Session-scoped degraded panel (no tab strip): a fresh browser gets
-                # the full panel back at once. Relaunch (~2s) and retry once.
-                logger.info("phase2_session.panel_degraded place_id=%s — relaunching", place_id)
-                self._close_browser()
-                self._open_browser()
-                ex = self._loop.run_until_complete(_do())
+                # Session-scoped degraded panel (no tab strip): retry once on a seeded
+                # new context, else a relaunched browser.
+                method, ex = self._recover_degraded(_retry)
+                logger.info("phase2_session.panel_degraded place_id=%s method=%s recovered=%d",
+                            place_id, method, int(not ex.get("degraded")))
+            else:
+                self._loop.run_until_complete(self._remember_good())
             return ex
         except Exception:
             logger.warning("phase2_session.panel_extras_failed place_id=%s",
@@ -559,10 +612,11 @@ class PlaywrightSession:
 
         Degraded session render (~half of fresh sessions: tabs Overview+Reviews only, a
         fixed 10-tile gallery, no chips): the panel tabs are checked first, and a
-        degraded panel or a degraded_gallery walk is re-walked ONCE on a relaunched
-        browser within the same PHASE2_WALK_MAX_S budget; an unrecovered retry keeps
-        the walk with more items. walk_meta gets
-        degraded_retry=1 and degraded_recovered (and degraded_panel=1 when the tabs
+        degraded panel or a degraded_gallery walk is re-walked ONCE (on a new context
+        seeded with the last full page's cookies, else a relaunched browser) within the
+        same PHASE2_WALK_MAX_S budget; an unrecovered retry keeps the walk with more
+        items. walk_meta gets degraded_retry=1, degraded_recovered,
+        degraded_recovery_method (cookie_context|relaunch) (and degraded_panel=1 when the tabs
         were degraded); the scrape() panel data is kept either way."""
         import os as _os
         if not self._page_alive():
@@ -618,19 +672,25 @@ class PlaywrightSession:
             # Walk first even on a degraded panel: a re-goto that lands degraded again
             # walked 0 items live (Glamour), the post-scrape preview walks ~9.
             hc = self._loop.run_until_complete(_do(max_s))
-            if bad_panel or hc["walk_meta"].get("degraded_gallery"):
+            if not (bad_panel or hc["walk_meta"].get("degraded_gallery")):
+                self._loop.run_until_complete(self._remember_good())
+            else:
                 left = max_s - int(time.monotonic() - t_start)
                 if left >= DEGRADED_RETRY_MIN_S:
-                    # Session-scoped degraded page: a fresh browser gets the full page back
-                    # (same relaunch as panel_extras). Panel data from scrape() is kept.
+                    # Session-scoped degraded page: a seeded new context (else a relaunched
+                    # browser) gets the full page back, as in panel_extras. Panel data from
+                    # scrape() is kept.
                     t_r = time.monotonic()
-                    logger.info("phase2_session.media_degraded place_id=%s panel=%d — relaunching",
+                    logger.info("phase2_session.media_degraded place_id=%s panel=%d — recovering",
                                 place_id, bad_panel)
+                    method = "error"
+
+                    async def _retry() -> tuple[bool, list[str]]:
+                        await _reopen()
+                        lb = await _tabs()
+                        return not _degraded(lb), lb
                     try:
-                        self._close_browser()
-                        self._open_browser()
-                        self._loop.run_until_complete(_reopen())
-                        labels2 = self._loop.run_until_complete(_tabs())
+                        method, labels2 = self._recover_degraded(_retry)
                         logger.info("phase2_session.panel_tabs place_id=%s retry=1 tabs=%s", place_id,
                                     ",".join(labels2)[:200])
                         left = max(1, max_s - int(time.monotonic() - t_start))
@@ -644,6 +704,7 @@ class PlaywrightSession:
                             hc = hc2
                         hc["walk_meta"]["degraded_retry"] = 1
                         hc["walk_meta"]["degraded_recovered"] = int(recovered)
+                        hc["walk_meta"]["degraded_recovery_method"] = method
                         hc["walk_meta"]["timings"]["degraded_retry"] = int((time.monotonic() - t_r) * 1000)
                         logger.info("phase2_session.media_degraded place_id=%s recovered=%d ms=%d",
                                     place_id, recovered, hc["walk_meta"]["timings"]["degraded_retry"])
@@ -652,6 +713,7 @@ class PlaywrightSession:
                                        place_id, exc_info=True)
                         hc["walk_meta"]["degraded_retry"] = 1
                         hc["walk_meta"]["degraded_recovered"] = 0
+                        hc["walk_meta"]["degraded_recovery_method"] = method
             if bad_panel:
                 hc["walk_meta"]["degraded_panel"] = 1
         except Exception:

@@ -53,6 +53,7 @@ class PlaceData:
     latest_review_at_max: Optional[str] = None
     latest_review_granularity: Optional[str] = None
     latest_review_verified: Optional[int] = None
+    degraded_panel: Optional[int] = None   # 1: tab strip without About/Photos (degraded session render)
 
     # --- Metadata ---
     source_url: str = ""

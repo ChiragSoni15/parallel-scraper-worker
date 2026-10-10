@@ -1241,6 +1241,25 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
 _NO_REVIEWS_JS = r"() => /\bNo reviews\b/i.test(document.querySelector('div[role=\"main\"]')?.innerText || '')"
 
 
+_PANEL_TABS_JS = r"""() => [...document.querySelectorAll('[role=tab]')]
+    .filter(t => { const r = t.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+    .map(t => (t.getAttribute('aria-label') || t.textContent || '').trim())"""
+
+
+async def _panel_degraded(page: Page) -> bool:
+    """Degraded session render: a tab strip with no About/Photos tab (Overview + Reviews only). No tabs at all is
+    not degraded (slow page or no-tab layout: the old path runs)."""
+    try:
+        await page.wait_for_selector('[role="tab"]', state="visible", timeout=3000)
+    except Exception:
+        pass
+    try:
+        labels = await page.evaluate(_PANEL_TABS_JS)
+    except Exception:
+        return False
+    return bool(labels) and not any(lbl.startswith(("About", "Photos")) for lbl in labels)
+
+
 async def _apply_normalised(page: Page, place: PlaceData, observed: datetime, review_info: dict) -> None:
     """§8.7: add the normalised keys; the raw fields stay untouched."""
     place.observed_at = _iso(observed)
@@ -1469,7 +1488,14 @@ async def _extract_all_raw(page: Page, url: str, config=None, place_id: Optional
         rc = int(str(place.review_count or "0").replace(",", ""))
     except (TypeError, ValueError):
         rc = 0
-    if rc > 0 and not closed_status:
+    if rc > 10 and not closed_status and await _panel_degraded(page):
+        # Degraded session render: the Reviews -> Newest chain times out (~36 s) here. Keep the default-order date,
+        # unverified, and return fast so the session-level retry can relaunch the browser. Up to 10 reviews the chain
+        # still runs: the all-cards rule verifies there without the Sort click (live Vimlesh: 8.7 s, verified).
+        place.degraded_panel = 1
+        if review_info is not None:
+            review_info["verified"] = False
+    elif rc > 0 and not closed_status:
         try:
             newest_date = await extract_latest_review_date(page, review_info, rc)
             if newest_date and newest_date != "N/A":
