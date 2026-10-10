@@ -1,6 +1,7 @@
 """Delisted places (design 2026-10-phase2-gallery-refresh §8.4).
 
-Worker side: `detect_delisted` needs positive evidence (a known Google removal text, not a /sorry/ page).
+Worker side: `detect_delisted` needs positive evidence (a known Google removal text, or Maps' redirect of an
+unresolvable place_id to an empty place, never a /sorry/ page).
 API side: `mark_delisted` writes the tombstone in one lease-gated transaction on a caller-supplied connection,
 so this module never imports the DB layer (the public worker imports it too).
 """
@@ -16,11 +17,21 @@ logger = logging.getLogger(__name__)
 # PHASE2_DELISTED_TEXTS (separated by '|').
 DELISTED_TEXTS = ["This place has been removed", "no longer exists"] + [
     t.strip() for t in os.environ.get("PHASE2_DELISTED_TEXTS", "").split("|") if t.strip()]
+# p200: Maps rewrites ?q=place_id:<gone id> to /maps/place//@<viewer's area> (empty place segment, no
+# name, no notice text). Reproduced across shards, IPs and a day apart. The ?q= form is /place/?q= (one slash).
+DELISTED_URL_MARK = "/maps/place//"
 
 
 def detect_delisted(page_text: str | None, page_url: str | None) -> str | None:
-    """The matched removal text when one is on the page and the URL is not a /sorry/ page, else None."""
-    if not page_text or "/sorry/" in (page_url or ""):
+    """Evidence (a removal text, or 'redirect:/maps/place//') unless the URL is a /sorry/ page, else None.
+    Only called once the panel has no name, so the redirect is never confused with a loaded place."""
+    url = page_url or ""
+    if "/sorry/" in url:
+        return None
+    if DELISTED_URL_MARK in url:
+        logger.info("delisted evidence redirect at %s", url)
+        return "redirect:" + DELISTED_URL_MARK
+    if not page_text:
         return None
     low = page_text.lower()
     for t in DELISTED_TEXTS:

@@ -243,14 +243,25 @@ def _page_url(session) -> str:
     return session.page_state()[0] if hasattr(session, "page_state") else ""
 
 
+# ponytail: guessed settle time for Maps' URL rewrite of a gone place (p200: 4 of 6 logged failures
+# still showed ?q=place_id:); no timing data, raise it if blanks with the old URL persist.
+_BLANK_RECHECK_S = 5.0
+
+
 def _delisted_or_raise(session, state, run_id, pid, attempts) -> None:
-    """Blank/FAILED scrape (§8.4, §9). /sorry/ -> BOT_PAGE, raise (retried). A known
-    removal text -> POST /phase2/delisted and return. Anything else -> raise as before."""
-    url, text = session.page_state(True) if hasattr(session, "page_state") else ("", "")
-    if "/sorry/" in url:
-        logger.warning("BOT_PAGE url=%s pid=%s", url, pid)
-        raise RuntimeError(f"bot page: {url}")
-    ev = delisted.detect_delisted(text, url)
+    """Blank/FAILED scrape (§8.4, §9). /sorry/ -> BOT_PAGE, raise (retried). Removal evidence
+    (text or the /maps/place//@ redirect) -> POST /phase2/delisted and return. No evidence ->
+    re-read once after _BLANK_RECHECK_S (the redirect lands late), then raise as before."""
+    def _check():
+        url, text = session.page_state(True) if hasattr(session, "page_state") else ("", "")
+        if "/sorry/" in url:
+            logger.warning("BOT_PAGE url=%s pid=%s", url, pid)
+            raise RuntimeError(f"bot page: {url}")
+        return url, delisted.detect_delisted(text, url)
+    url, ev = _check()
+    if not ev:
+        time.sleep(_BLANK_RECHECK_S)
+        url, ev = _check()
     if not ev:
         raise RuntimeError("blank-after-warmup / no data")
     out = state.mark_delisted(run_id, pid, attempts, _utc_iso(), ev, url) or {}
@@ -762,8 +773,10 @@ def shard_exit_code(gate: _GateState, max_fail: float) -> int:
     if gate.leased and not den:
         logger.error("phase2.gate exit=3 reason=no_accepted_rows leased=%d", gate.leased)
         return 3
-    if rate > max_fail:
-        logger.error("phase2.gate exit=3 reason=fail_rate %.3f > %.3f", rate, max_fail)
+    # ponytail: ratio gate needs a floor, else 3 bad listings in a 20-place shard trip it (p200)
+    min_failed = int(os.environ.get("PHASE2_SHARD_MIN_FAILED", "5") or "5")
+    if rate > max_fail and gate.acc_failed >= min_failed:
+        logger.error("phase2.gate exit=3 reason=fail_rate %.3f > %.3f (failed=%d >= %d)", rate, max_fail, gate.acc_failed, min_failed)
         return 3
     return 0
 
