@@ -1,4 +1,7 @@
 name: phase2-scrape
+# Read by the sequencer (gh run list displayTitle): run id, lane and shards of each run,
+# so ramp mode can count the shards a fleet really runs. Keep this format.
+run-name: phase2 ${{ inputs.run_id || vars.ACTIVE_RUN_ID }} lane=${{ inputs.lane || '0' }} shards=${{ inputs.shards || vars.ACTIVE_SHARDS || '20' }}
 
 # PUBLIC Phase 2 deep-scrape worker. Holds NO DB/Drive creds — only:
 #   secret  WORKER_TOKEN     (bearer for the lease/submit API on the VM)
