@@ -28,6 +28,9 @@ on:
       walk_max_s:     { required: false, type: string, default: "" }  # PHASE2_WALK_MAX_S
       shard_max_fail: { required: false, type: string, default: "" }  # PHASE2_SHARD_MAX_FAIL (fraction, code default 0.10)
       staging:     { required: false, type: string, default: "0" }   # PHASE2_STAGING 0|shadow|1 (design §13c)
+      photo_dates_slim: { required: false, type: string, default: "0" }  # 1 = PHASE2_PHOTO_DATES_SLIM (drop photo_dates.items; owner go 11 Oct)
+      lane:        { required: false, type: string, default: "0" }   # ramp mode: extra run of the same run_id
+                                                                     #   on this fleet (own concurrency group)
   # MANUAL DISPATCH ONLY. The 30-minute self-drain cron was removed: with 21
   # fleet repos it meant every one of them picked up a run within half an hour of
   # ACTIVE_RUN_ID being set, which is far more concurrency than the lease API can
@@ -36,7 +39,9 @@ on:
 
 # Scheduled runs have no inputs -> fall back to repo variables.
 concurrency:
-  group: phase2-${{ inputs.run_id || vars.ACTIVE_RUN_ID || 'none' }}
+  # lane: the sequencer's ramp mode runs several runs of one run_id on a fleet at once;
+  # without it a second dispatch waits as 'pending' and a third replaces the second.
+  group: phase2-${{ inputs.run_id || vars.ACTIVE_RUN_ID || 'none' }}-${{ inputs.lane || '0' }}
   cancel-in-progress: false
 
 jobs:
@@ -192,6 +197,7 @@ jobs:
           # object per outlet under p2shadow/; 1 = objects under p2results/ + /phase2/staged refs.
           # Objects use PHASE2_SHOT_BLOB_SAS (fallback MEDIA_BLOB_WRITE_SAS, not a fleet secret today).
           PHASE2_STAGING: "${{ inputs.staging || '0' }}"
+          PHASE2_PHOTO_DATES_SLIM: "${{ inputs.photo_dates_slim || '0' }}"
           PHASE2_SPOOL_DIR: ${{ github.workspace }}/_p2spool
         # Exit 3 = this shard lost work (design §9 level 1); the run gate is in the sequencer.
         run: |

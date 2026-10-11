@@ -190,7 +190,7 @@ def _photos_one(run_id, pid, row, panel_urls) -> tuple[list[dict], dict]:
     pd = row.get("photo_dates") or {}
     items = pd.get("items") or []
     wm = pd.get("walk_meta") or {"walk_ok": False, "reason": "no_capture"}
-    selected, outcomes, media = [], None, []
+    selected, outcomes, media, cands, sv = [], None, [], [], None
     try:
         # Identity = viewer key, not URL: one photo can arrive under different URL
         # paths. A repeat is merged, not dropped (gallery_select §2 step 4 rules):
@@ -265,8 +265,45 @@ def _photos_one(run_id, pid, row, panel_urls) -> tuple[list[dict], dict]:
         selected, outcomes, media = [], None, []
     summ = gs.summary(items, selected, wm, outcomes)
     # §8.3: a failed walk stores only the summary, never a partial photo_dates.
-    row["photo_dates"] = {**pd, "summary": summ} if summ["walk_ok"] else {"summary": summ}
+    if not summ["walk_ok"]:
+        row["photo_dates"] = {"summary": summ}
+    elif os.environ.get("PHASE2_PHOTO_DATES_SLIM", "0") == "1":
+        row["photo_dates"] = _slim_photo_dates(pd, summ, cands, selected, sv)
+    else:
+        row["photo_dates"] = {**pd, "summary": summ}
     return media, tm
+
+
+def _slim_photo_dates(pd, summ, cands, selected, sv) -> dict:
+    """PHASE2_PHOTO_DATES_SLIM=1: cut place_data log bytes. Selection already ran and
+    place_media holds the kept photos, so the walk lists are audit-only: drop `items`,
+    shrink `place_photos` to {url_sha16, posted_month, kind, selected, band, ordinal}
+    per candidate. selected = has a place_media row. Other keys pass through unchanged.
+    url_sha16 = first 16 hex of sha1(url as place_media.source_url stores it: =s1600
+    for photos, upscaled for Street View) — the audit join key candidate -> media row.
+    place_media.sha1 is the hash of the image BYTES, not of the URL: never join on it."""
+    import hashlib
+    from cloud import blob_shots
+    from parallel_scraper import gallery_select as gs
+    band = {s.url: s.band for s in selected if s.source != "street_view"}
+    sv_sel = any(s.source == "street_view" for s in selected)
+
+    def sha16(c):
+        u = c.get("url")
+        if not u:
+            return None
+        u = (blob_shots._upscale_url(u) if gs.item_kind(c) == "street_view"
+             else u.split("=")[0] + "=s1600")
+        return hashlib.sha1(u.encode()).hexdigest()[:16]
+
+    out = {k: v for k, v in pd.items() if k != "items"}
+    out["place_photos"] = [
+        {"url_sha16": sha16(c), "posted_month": gs.parse_photo_month(c.get("caption")),
+         "kind": gs.item_kind(c), "selected": c.get("url") in band or (c is sv and sv_sel),
+         "band": band.get(c.get("url")) or None, "ordinal": c.get("ordinal")}
+        for c in cands]
+    out["summary"] = {**summ, "slim": 1}
+    return out
 
 
 def _page_url(session) -> str:
