@@ -17,6 +17,8 @@ class P2Result:
     done: int = 0
     failed: int = 0
     attrs_unsent: int = 0   # /attributes rows still unsent after the final flush
+    spool_left: int = 0     # §13c staging: objects never acknowledged by Blob (lost work)
+    refs_unreported: int = 0  # §13c staging: durable objects whose /phase2/staged report failed
 
 
 def _default_session_factory(work_dir: str):

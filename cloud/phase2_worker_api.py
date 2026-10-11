@@ -24,7 +24,7 @@ from pathlib import Path
 from parallel_scraper.logging_setup import phase_var, run_id_var, setup_logging
 from parallel_scraper.normalise import null_if_sentinel
 
-from cloud import delisted
+from cloud import delisted, staging
 from cloud.http_state import HttpState
 from cloud.phase2_common import P2Result, _default_session_factory, _split_image_urls
 _RECLAIM_MIN = int(os.environ.get("PHASE2_RECLAIM_MINUTES", "30") or "30")
@@ -402,6 +402,13 @@ def _lease_with_retry(state, run_id, shard, batch, attempts: int = 5,
                 return []
             time.sleep(min(60.0, 15.0 * i) + (hash(str(shard)) % 7))
             continue
+        if info.get("hold"):
+            # §13c ingest pause: the API holds every lease. Flush, wait, ask again; a hold
+            # does not count toward the empty-lease limit.
+            if flush is not None:
+                flush()
+            time.sleep(max(1.0, float(info.get("retry_after_s") or 60)))
+            continue
         if not pending or waited >= max_wait:
             if pending:
                 logger.info("phase2.lease_wait_exhausted run_id=%s shard=%s waited=%.0fs",
@@ -423,6 +430,71 @@ def _resolve_concurrency(concurrency) -> int:
     except (TypeError, ValueError):
         k = 1
     return max(1, min(5, k))
+
+
+def _make_stager(run_id, shard):
+    """§13c: a Stager for PHASE2_STAGING=shadow|1, None for 0 (today's path)."""
+    m = staging.mode()
+    if m == "0":
+        return None
+    logger.info("phase2.staging mode=%s run_id=%s shard=%s", m, run_id, shard)
+    return staging.Stager(run_id, m, worker=os.environ.get("GITHUB_REPOSITORY", ""), shard=str(shard))
+
+
+def _stage_one(stager, result, done, failed, extras, repair_gen) -> bool:
+    """Write one outlet's object to the spool (mode shadow|1). Returns True when this place's
+    result must NOT also go to /results (mode 1). Delisted places (both None) have no object."""
+    if stager is None or (done is None and failed is None):
+        return False
+    try:
+        if done is not None:
+            stager.stage(done, "done", repair_gen=repair_gen, attributes=extras)
+        else:
+            stager.stage(failed, "failed", repair_gen=repair_gen)
+    except Exception:
+        # Spool write failed (disk): in mode 1 the place is leased but never reported, so it
+        # counts as lost work (exit 3) and comes back through reclaim.
+        logger.error("phase2.stage_failed pid=%s", (done or failed)["place_id"], exc_info=True)
+    if stager.mode != "1":
+        return False
+    if done is not None:
+        result.done += 1
+    else:
+        result.failed += 1
+    return True
+
+
+def _spool_wait(stager, flush, deadline: float | None = None) -> bool:
+    """Spool at its cap: lease nothing until it drains (keep reporting meanwhile). Returns
+    False when leasing must stop: 403 (the SAS expired), or the time budget ran out while
+    waiting (the shard then drains and exits; leftovers are exit 3)."""
+    while stager is not None and not stager.forbidden and stager.full():
+        if deadline is not None and time.monotonic() >= deadline:
+            logger.warning("phase2.spool_full_at_budget spooled=%d", stager.spooled())
+            return False
+        flush()
+        time.sleep(0.5)
+    if stager is not None and stager.forbidden:
+        logger.error("phase2.stage_forbidden: result SAS refused (403); leasing stopped")
+        return False
+    return True
+
+
+def _finish_stager(stager, result, final_flush) -> None:
+    """Shard end: drain the spool (<= 120 s), run the final flush (which reports every
+    acknowledged ref in mode 1), then record what is left."""
+    if stager is not None:
+        stager.drain(staging.DRAIN_S)
+    final_flush()
+    if stager is None:
+        return
+    stager.close()
+    result.spool_left = stager.spooled()
+    result.refs_unreported = len(stager.refs)
+    logger.info("phase2.staging_end mode=%s uploaded=%d spool_left=%d refs_unreported=%d "
+                "accepted=%d superseded=%d rejected=%d put_errors=%d", stager.mode, stager.uploaded,
+                result.spool_left, result.refs_unreported, stager.accepted, stager.superseded,
+                stager.rejected, stager.put_errors)
 
 
 def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
@@ -463,9 +535,12 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
     pend_done: list[dict] = []
     pend_failed: list[dict] = []
     pend_attrs: list[dict] = []
+    stager = _make_stager(run_id, shard)
 
     def flush(final: bool = False):
         nonlocal last_flush
+        if stager is not None and stager.mode == "1":
+            stager.report(state)                  # refs of acknowledged objects -> /phase2/staged
         _flush_attrs(state, run_id, pend_attrs)   # first: a raising results submit must not skip it
         send, keep = (_withhold_for_unsent_attrs(pend_done, pend_attrs) if final
                       else (list(pend_done), []))
@@ -491,7 +566,12 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
                 break
             if max_places is not None and (result.done + result.failed + len(pend_done) + len(pend_failed)) >= max_places:
                 break
-            leased = _lease_with_retry(state, run_id, shard, batch,
+            if not _spool_wait(stager, flush, started + stop_after if stop_after else None):
+                break
+            n = batch if stager is None else min(int(batch), stager.lease_room(0))
+            if n <= 0:     # cannot happen after _spool_wait; never lease 0
+                continue
+            leased = _lease_with_retry(state, run_id, shard, n,
                                        deadline=started + stop_after, flush=flush)
             if not leased:
                 break
@@ -500,13 +580,16 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
                 attempts = int(rec["attempts"])
                 done, failed, ex = _scrape_one(session, run_id, pid, attempts,
                                                capture_shots, state, state)
-                if done is not None:
+                staged = _stage_one(stager, result, done, failed, ex, int(rec.get("repair_gen") or 0))
+                if staged:
+                    pass                 # mode 1: the object carries result + attributes
+                elif done is not None:
                     pend_done.append(done)
                 elif failed is not None:
                     pend_failed.append(failed)
                 else:
                     result.done += 1     # delisted: tombstoned, counts as done (§9)
-                if ex:
+                if ex and not staged:
                     pend_attrs.append(ex)
                 n_since_recycle += 1
                 if n_since_recycle >= recycle_every:
@@ -515,9 +598,10 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
                     except Exception:
                         logger.debug("recycle_failed", exc_info=True)
                     n_since_recycle = 0
-                if (time.monotonic() - last_flush) >= flush_interval_s:
+                since = time.monotonic() - last_flush
+                if since >= flush_interval_s or (stager is not None and stager.report_due(since)):
                     flush()
-        flush(final=True)
+        _finish_stager(stager, result, lambda: flush(final=True))
     finally:
         try:
             session.close()
@@ -615,6 +699,8 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
     sessions: list = []
     sessions_lock = threading.Lock()
     leased_total = 0  # feeder-only
+    processed = [0]   # places the workers finished (staged, buffered or failed); under `lock`
+    stager = _make_stager(run_id, shard)
 
     logger.info("phase2.concurrent_start run_id=%s shard=%s k=%d", run_id, shard, k)
 
@@ -632,10 +718,12 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
                 item = work_q.get()
                 if item is _SENTINEL:
                     return
-                pid, attempts = item
+                pid, attempts, gen = item
+                failed = {"place_id": pid, "attempts": attempts, "error": "worker setup failed"}
                 with lock:
-                    pend_failed.append({"place_id": pid, "attempts": attempts,
-                                        "error": "worker setup failed"})
+                    if not _stage_one(stager, result, None, failed, None, gen):
+                        pend_failed.append(failed)
+                    processed[0] += 1
             return
         with sessions_lock:
             sessions.append(session)
@@ -644,18 +732,22 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
             item = work_q.get()
             if item is _SENTINEL:
                 return
-            pid, attempts = item
+            pid, attempts, gen = item
             done, failed, extras = _scrape_one(session, run_id, pid, attempts,
                                                capture_shots, shot_state, state)
             with lock:
-                if done is not None:
+                staged = _stage_one(stager, result, done, failed, extras, gen)
+                if staged:
+                    pass                 # mode 1: the object carries result + attributes
+                elif done is not None:
                     pend_done.append(done)
                 elif failed is not None:
                     pend_failed.append(failed)
                 else:
                     result.done += 1     # delisted: tombstoned, counts as done (§9)
-                if extras:
+                if extras and not staged:
                     pend_attrs.append(extras)
+                processed[0] += 1
             n_since_recycle += 1
             if n_since_recycle >= recycle_every:
                 try:
@@ -665,6 +757,8 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
                 n_since_recycle = 0
 
     def flush(final: bool = False):
+        if stager is not None and stager.mode == "1":
+            stager.report(state)                  # refs of acknowledged objects -> /phase2/staged
         with lock:
             done = pend_done[:]
             failed = pend_failed[:]
@@ -728,24 +822,34 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
                 break
             if max_places is not None and leased_total >= max_places:
                 break
-            # Hold off leasing while the workers still have a buffer; flush on interval.
-            if work_q.qsize() >= high_water:
-                if flush_interval_s and (now - last_flush) >= flush_interval_s:
+            # Hold off leasing while the workers still have a buffer, or while the staging
+            # spool is at its cap (§13c); flush on interval.
+            if stager is not None and stager.forbidden:
+                logger.error("phase2.stage_forbidden: result SAS refused (403); leasing stopped")
+                break
+            with lock:
+                held = leased_total - processed[0]
+            room = int(batch) if stager is None else min(int(batch), stager.lease_room(held))
+            if work_q.qsize() >= high_water or room <= 0:
+                if (flush_interval_s and (now - last_flush) >= flush_interval_s) or (
+                        stager is not None and stager.report_due(now - last_flush)):
                     flush()
                     last_flush = time.monotonic()
                 time.sleep(0.2)
                 continue
-            leased = _lease_with_retry(state, run_id, shard, batch,
+            leased = _lease_with_retry(state, run_id, shard, room,
                                        deadline=started + stop_after, flush=wait_flush)
             if not leased:
                 break
             for rec in leased:
                 pid = str(rec["place_id"])
                 attempts = int(rec["attempts"])
-                work_q.put((pid, attempts))
+                work_q.put((pid, attempts, int(rec.get("repair_gen") or 0)))
                 leased_total += 1
             # Mid-run flush so results land while workers keep scraping.
-            if flush_interval_s and (time.monotonic() - last_flush) >= flush_interval_s:
+            since = time.monotonic() - last_flush
+            if (flush_interval_s and since >= flush_interval_s) or (
+                    stager is not None and stager.report_due(since)):
                 flush()
                 last_flush = time.monotonic()
     finally:
@@ -757,10 +861,13 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
         while any(t.is_alive() for t in threads):
             for t in threads:
                 t.join(timeout=1.0)
-            if flush_interval_s and (time.monotonic() - last_flush) >= flush_interval_s:
+            since = time.monotonic() - last_flush
+            if (flush_interval_s and since >= flush_interval_s) or (
+                    stager is not None and stager.report_due(since)):
                 flush()
                 last_flush = time.monotonic()
-        flush(final=True)  # final flush after every pid is accounted for
+        # final flush after every pid is accounted for (and the spool drained)
+        _finish_stager(stager, result, lambda: flush(final=True))
         with sessions_lock:
             for s in sessions:
                 try:
@@ -786,6 +893,7 @@ class _GateState:
         self.submitted = 0       # rows in submits that returned (accepted or stale)
         self.acc_done = 0
         self.acc_failed = 0
+        self.superseded = 0      # §13c: refs answered 'superseded' (not lost work)
         self._warned = False
         self._first_lease = self._first_done = False
         self._lock = threading.Lock()   # mark_delisted comes from the K worker threads
@@ -824,6 +932,19 @@ class _GateState:
         return out
 
 
+    def submit_staged(self, run_id, refs):
+        """§13c mode 1: accepted and superseded refs are submitted work; rejected refs are not."""
+        out = self._inner.submit_staged(run_id, refs) or {}
+        with self._lock:
+            self.submitted += int(out.get("accepted", 0)) + int(out.get("superseded", 0))
+            self.acc_done += int(out.get("accepted_done", 0))
+            self.acc_failed += int(out.get("accepted_failed", 0))
+            self.superseded += int(out.get("superseded", 0))
+        if self.acc_done and not self._first_done:
+            self._first_done = True
+            print(f"STARTUP t_first_done={int(time.time())}", flush=True)
+        return out
+
     def mark_delisted(self, *args, **kwargs):
         """An accepted tombstone counts as done (§9); a stale one as submitted only."""
         out = self._inner.mark_delisted(*args, **kwargs) or {}
@@ -833,22 +954,34 @@ class _GateState:
         return out
 
 
-def shard_exit_code(gate: _GateState, max_fail: float, attrs_unsent: int = 0) -> int:
+def shard_exit_code(gate: _GateState, max_fail: float, attrs_unsent: int = 0,
+                    spool_left: int = 0, refs_unreported: int = 0) -> int:
     """0 ok, 3 = this shard lost work (§9 level 1). Results are already flushed.
-    attrs_unsent: /attributes rows the final flush could not send; lost work like results."""
-    lost = gate.leased - gate.submitted
+    attrs_unsent: /attributes rows the final flush could not send; lost work like results.
+    §13c mode 1: spool_left = objects never acknowledged by Blob (lost work, exit 3);
+    refs_unreported = durable objects whose /phase2/staged report failed: not lost (reconcile
+    stages them), so they are not 'unflushed'; superseded refs are not lost either."""
+    lost = gate.leased - gate.submitted - refs_unreported
     den = gate.acc_done + gate.acc_failed
     rate = gate.acc_failed / den if den else 0.0
+    superseded = int(getattr(gate, "superseded", 0) or 0)
     logger.info("phase2.gate leased=%d submitted=%d accepted_done=%d accepted_failed=%d "
-                "unflushed=%d fail_rate=%.3f max=%.3f api_503=%d attrs_unsent=%d",
+                "unflushed=%d fail_rate=%.3f max=%.3f api_503=%d attrs_unsent=%d "
+                "spool_left=%d refs_unreported=%d superseded=%d",
                 gate.leased, gate.submitted, gate.acc_done, gate.acc_failed, lost, rate, max_fail,
-                int(getattr(gate, "api_503", 0) or 0), attrs_unsent)
-    reasons = [r for r, n in (("unflushed_buffer", lost), ("attrs_unsent", attrs_unsent)) if n > 0]
-    if reasons:   # both named when both lost work: no reason hides the other
-        logger.error("phase2.gate exit=3 reason=%s unflushed=%d attrs_unsent=%d",
-                     "+".join(reasons), lost, attrs_unsent)
+                int(getattr(gate, "api_503", 0) or 0), attrs_unsent, spool_left, refs_unreported,
+                superseded)
+    reasons = [r for r, n in (("unflushed_buffer", lost), ("attrs_unsent", attrs_unsent),
+                              ("spool_unsent", spool_left)) if n > 0]
+    if reasons:   # all named when several lost work: no reason hides another
+        logger.error("phase2.gate exit=3 reason=%s unflushed=%d attrs_unsent=%d spool_left=%d",
+                     "+".join(reasons), lost, attrs_unsent, spool_left)
         return 3
-    if gate.leased and not den:
+    if refs_unreported:
+        logger.error("phase2.gate refs_unreported=%d: objects are durable in Blob but their "
+                     "/phase2/staged report failed; not lost work, reconcile stages them",
+                     refs_unreported)
+    if gate.leased and not (den + superseded + refs_unreported):
         logger.error("phase2.gate exit=3 reason=no_accepted_rows leased=%d", gate.leased)
         return 3
     # ponytail: ratio gate needs a floor, else 3 bad listings in a 20-place shard trip it (p200)
@@ -881,7 +1014,12 @@ def main(argv=None, state=None) -> int:
     res = run_worker(args.run_id, args.shard, max_minutes=args.max_minutes,
                      batch=args.batch, max_places=args.max_places,
                      concurrency=args.concurrency, state=gate)
-    return shard_exit_code(gate, args.max_fail_pct / 100.0, attrs_unsent=res.attrs_unsent)
+    if staging.mode() != "1":   # shadow: results went to /results; a left-over shadow object is not lost work
+        if res.spool_left:
+            logger.warning("phase2.shadow_spool_left=%d (not counted as lost work)", res.spool_left)
+        res.spool_left = res.refs_unreported = 0
+    return shard_exit_code(gate, args.max_fail_pct / 100.0, attrs_unsent=res.attrs_unsent,
+                           spool_left=res.spool_left, refs_unreported=res.refs_unreported)
 
 
 if __name__ == "__main__":

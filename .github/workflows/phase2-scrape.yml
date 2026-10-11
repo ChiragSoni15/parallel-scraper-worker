@@ -27,6 +27,7 @@ on:
       walk_max_items: { required: false, type: string, default: "" }  # PHASE2_WALK_MAX_ITEMS
       walk_max_s:     { required: false, type: string, default: "" }  # PHASE2_WALK_MAX_S
       shard_max_fail: { required: false, type: string, default: "" }  # PHASE2_SHARD_MAX_FAIL (fraction, code default 0.10)
+      staging:     { required: false, type: string, default: "0" }   # PHASE2_STAGING 0|shadow|1 (design §13c)
   # MANUAL DISPATCH ONLY. The 30-minute self-drain cron was removed: with 21
   # fleet repos it meant every one of them picked up a run within half an hour of
   # ACTIVE_RUN_ID being set, which is far more concurrency than the lease API can
@@ -187,6 +188,11 @@ jobs:
           PHASE2_PANEL_EXTRAS: "${{ inputs.panel_extras || vars.ACTIVE_PANEL_EXTRAS || '0' }}"
           PHASE2_MENU_TAB: "${{ inputs.menu_tab || vars.ACTIVE_MENU_TAB || '1' }}"
           PHASE2_FLUSH_INTERVAL_S: "${{ inputs.flush_s || '20' }}"
+          # Durable result staging (design §13c): 0 = /results as today; shadow = also one Blob
+          # object per outlet under p2shadow/; 1 = objects under p2results/ + /phase2/staged refs.
+          # Objects use PHASE2_SHOT_BLOB_SAS (fallback MEDIA_BLOB_WRITE_SAS, not a fleet secret today).
+          PHASE2_STAGING: "${{ inputs.staging || '0' }}"
+          PHASE2_SPOOL_DIR: ${{ github.workspace }}/_p2spool
         # Exit 3 = this shard lost work (design §9 level 1); the run gate is in the sequencer.
         run: |
           [ -n "$IN_WALK_PHOTO_CAP" ] && export PHASE2_WALK_PHOTO_CAP="$IN_WALK_PHOTO_CAP"
@@ -202,6 +208,17 @@ jobs:
             --concurrency "${{ inputs.concurrency || vars.ACTIVE_CONCURRENCY || '3' }}" \
             --batch "${{ inputs.batch || '20' }}"
           RC=$?; kill $SAMPLER 2>/dev/null; exit $RC
+
+      # Staging objects the shard could not upload before it ended (exit 3). Replay later with
+      # python -m cloud.staging --replay-spool <dir> --run-id <run_id> (design §13c.3).
+      - name: Upload result spool
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2spool-${{ inputs.run_id || vars.ACTIVE_RUN_ID }}-shard-${{ matrix.shard }}
+          path: ${{ github.workspace }}/_p2spool
+          if-no-files-found: ignore
+          retention-days: 14
 
       # The durable screenshot queue: each shard's captured PNGs + manifest.jsonl, uploaded
       # off the ephemeral runner. Drained to Drive later by cloud/drain_screenshots.py.

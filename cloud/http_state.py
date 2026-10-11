@@ -100,8 +100,11 @@ class HttpState:
             raise
 
     def claim_place_ids(self, run_id: str, worker, n: int) -> list[dict]:
-        out = self._request("POST", "/phase2/lease",
-                            json={"run_id": run_id, "worker": str(worker), "n": int(n)})
+        body = {"run_id": run_id, "worker": str(worker), "n": int(n)}
+        mode = (os.environ.get("PHASE2_STAGING") or "0").strip().lower()
+        if mode != "0":   # §13c: lets the API hold leases of staging runs during an ingest pause
+            body["staging"] = mode
+        out = self._request("POST", "/phase2/lease", json=body)
         self.last_lease = out
         return out.get("pids", [])
 
@@ -136,6 +139,18 @@ class HttpState:
             chunk.append((kind, item))
             size += b
         self._post_results(run_id, chunk, total)
+        return total
+
+    def submit_staged(self, run_id: str, refs: list[dict]) -> dict:
+        """POST refs to durable result objects (design §13c), <= 500 per call; counts summed.
+        A failed chunk raises: the caller keeps every ref not yet answered (rule F makes a
+        re-report of an answered ref a no-op)."""
+        total: dict = {}
+        for i in range(0, len(refs), 500):
+            out = self._request("POST", "/phase2/staged", json={"run_id": run_id, "refs": refs[i:i + 500]})
+            for k, v in (out or {}).items():
+                if isinstance(v, int) and not isinstance(v, bool):
+                    total[k] = total.get(k, 0) + v
         return total
 
     def _post_results(self, run_id: str, chunk: list, total: dict) -> None:
