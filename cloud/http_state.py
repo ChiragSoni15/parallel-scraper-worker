@@ -28,6 +28,7 @@ class HttpState:
         self.token = token or os.environ["WORKER_TOKEN"]
         self.timeout = timeout
         self.last_lease: dict = {}   # last /phase2/lease body: pending / retry_after_s on empty
+        self.last_reclaim: dict = {}  # last /phase2/reclaim body
         self.api_503 = 0             # 503 + Retry-After answers (API shed the call before any DB work)
         self._n_lock = threading.Lock()
         self._s = requests.Session()
@@ -190,6 +191,7 @@ class HttpState:
     def reclaim_place_ids(self, run_id: str, older_than_minutes: int = 30) -> int:
         out = self._request("POST", "/phase2/reclaim",
                             json={"run_id": run_id, "older_than_minutes": int(older_than_minutes)})
+        self.last_reclaim = out   # may carry skipped=cooldown|busy (cloud/api.py _reclaim)
         return int(out.get("reclaimed", 0))
 
     def upload_screenshots(self, run_id: str, place_id: str, attempts: int, paths: dict) -> dict:

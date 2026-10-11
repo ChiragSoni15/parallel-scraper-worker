@@ -497,6 +497,22 @@ def _finish_stager(stager, result, final_flush) -> None:
                 stager.rejected, stager.put_errors)
 
 
+def _startup_reclaim(state, run_id) -> None:
+    """Shard 0 reclaims stale leases at start (manual dispatch has no sequencer). The API
+    answers {"reclaimed": 0, "skipped": "cooldown"|"busy"} when this pod reclaimed the run
+    recently or is reclaiming another: that is normal, logged at DEBUG only."""
+    try:
+        n = state.reclaim_place_ids(run_id, _RECLAIM_MIN)
+    except Exception:
+        logger.warning("phase2.reclaim_failed", exc_info=True)
+        return
+    skipped = (getattr(state, "last_reclaim", None) or {}).get("skipped")
+    if skipped:
+        logger.debug("phase2.reclaim_skipped run_id=%s reason=%s", run_id, skipped)
+    else:
+        logger.info("phase2.reclaim run_id=%s reclaimed=%d", run_id, n)
+
+
 def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
                session_factory=None, flush_interval_s=None, max_places=None,
                concurrency=None) -> P2Result:
@@ -518,10 +534,7 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
             max_places=max_places)
 
     if str(shard) == "0":
-        try:
-            logger.info("phase2.reclaim run_id=%s reclaimed=%d", run_id, state.reclaim_place_ids(run_id, _RECLAIM_MIN))
-        except Exception:
-            logger.warning("phase2.reclaim_failed", exc_info=True)
+        _startup_reclaim(state, run_id)
 
     work_dir = tempfile.mkdtemp(prefix="p2api_")
     session = (session_factory or (lambda **k: _default_session_factory(work_dir)))(work_dir=work_dir)
@@ -678,10 +691,7 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
     submitted exactly once (done XOR failed). K==1 never reaches here.
     """
     if str(shard) == "0":
-        try:
-            logger.info("phase2.reclaim run_id=%s reclaimed=%d", run_id, state.reclaim_place_ids(run_id, _RECLAIM_MIN))
-        except Exception:
-            logger.warning("phase2.reclaim_failed", exc_info=True)
+        _startup_reclaim(state, run_id)
 
     result = P2Result()
     started = time.monotonic()
