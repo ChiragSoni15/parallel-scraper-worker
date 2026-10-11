@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import random
+import threading
 import time
 
 import requests
@@ -19,6 +20,8 @@ class HttpState:
         self.token = token or os.environ["WORKER_TOKEN"]
         self.timeout = timeout
         self.last_lease: dict = {}   # last /phase2/lease body: pending / retry_after_s on empty
+        self.api_503 = 0             # 503 + Retry-After answers (API shed the call before any DB work)
+        self._n_lock = threading.Lock()
         self._s = requests.Session()
         self._s.headers["Authorization"] = f"Bearer {self.token}"
         # When the API uses a self-signed cert (e.g. Azure static IP, no domain), pin it:
@@ -41,6 +44,17 @@ class HttpState:
             final = attempt == self._ATTEMPTS - 1
             try:
                 r = self._s.request(method, self.base + path, json=json, params=params, timeout=self.timeout)
+                ra = r.headers.get("Retry-After") if r.status_code == 503 else None
+                if ra is not None:
+                    # Load shed (cloud/api.py): no DB work was done. Wait what the API asks
+                    # (+-30% jitter so shards do not return together). The last attempt
+                    # raises below, and the caller keeps its rows for the next flush.
+                    with self._n_lock:
+                        self.api_503 += 1
+                    if not final:
+                        last = RuntimeError(f"503 Retry-After {ra}")
+                        time.sleep(self._retry_after_s(ra))
+                        continue
                 if r.status_code >= 500 and not final:
                     last = RuntimeError(f"{r.status_code}: {r.text[:200]}")
                     time.sleep(min(self._BACKOFF_CAP, 0.5 * (2 ** attempt)) + random.uniform(0, 0.5))
@@ -56,6 +70,14 @@ class HttpState:
         if last is not None:
             raise last
         raise RuntimeError("unreachable")
+
+    @staticmethod
+    def _retry_after_s(value: str) -> float:
+        try:
+            base = max(1.0, float(value))
+        except (TypeError, ValueError):
+            base = 15.0
+        return min(60.0, base * random.uniform(0.7, 1.3))
 
     # --- surface the worker calls -------------------------------------------------
     def get_run(self, run_id: str):

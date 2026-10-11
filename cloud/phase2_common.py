@@ -16,6 +16,7 @@ from pathlib import Path
 class P2Result:
     done: int = 0
     failed: int = 0
+    attrs_unsent: int = 0   # /attributes rows still unsent after the final flush
 
 
 def _default_session_factory(work_dir: str):

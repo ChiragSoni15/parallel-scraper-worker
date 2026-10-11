@@ -327,18 +327,37 @@ def _panel_extras_one(session, run_id, pid):
     return row
 
 
-def _flush_attrs(state, run_id, pend_attrs):
-    """Submit buffered Overview rows. Never raises: losing additive fields must
-    not lose the metadata flush that rides beside it."""
-    if not pend_attrs:
-        return
-    try:
-        out = state.submit_attributes(run_id, list(pend_attrs))
-        logger.info("phase2.attrs_flush rows=%d %s", len(pend_attrs), out)
-    except Exception:
-        logger.warning("phase2.attrs_flush_failed run_id=%s rows=%d", run_id,
-                       len(pend_attrs), exc_info=True)
-    pend_attrs.clear()
+_ATTR_CHUNK = 200   # cloud/api.py WORKER_MAX_RESULTS: a kept-and-grown buffer must not hit 413
+
+
+def _flush_attrs(state, run_id, pend_attrs) -> None:
+    """Submit buffered Overview rows, in place: sent rows leave pend_attrs, unsent rows
+    stay for the next flush (a 503, any non-2xx, any error). Never raises: losing
+    additive fields must not lose the metadata flush that rides beside it."""
+    while pend_attrs:
+        chunk = pend_attrs[:_ATTR_CHUNK]
+        try:
+            out = state.submit_attributes(run_id, chunk)
+        except Exception:
+            logger.warning("phase2.attrs_flush_failed run_id=%s rows=%d kept", run_id,
+                           len(pend_attrs), exc_info=True)
+            return
+        del pend_attrs[:len(chunk)]
+        logger.info("phase2.attrs_flush rows=%d %s", len(chunk), out)
+
+
+def _withhold_for_unsent_attrs(done: list[dict], attrs_left: list[dict]) -> tuple[list, list]:
+    """Final flush only: (done rows to submit, done rows to keep). A place whose attribute
+    rows could not be sent is NOT submitted as done, so it stays 'scraping', is reclaimed
+    after the reclaim window and re-scraped with its attributes (reclaim selects only
+    'scraping'; a done place would never get them back). The gate counts the kept rows
+    as unflushed -> exit 3."""
+    hold = {str(a.get("place_id")) for a in attrs_left}
+    send = [d for d in done if str(d["place_id"]) not in hold]
+    keep = [d for d in done if str(d["place_id"]) in hold]
+    if keep:
+        logger.warning("phase2.final_flush_withheld rows=%d (attributes unsent; left for reclaim)", len(keep))
+    return send, keep
 
 
 def _lease_with_retry(state, run_id, shard, batch, attempts: int = 5,
@@ -445,21 +464,23 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
     pend_failed: list[dict] = []
     pend_attrs: list[dict] = []
 
-    def flush():
+    def flush(final: bool = False):
         nonlocal last_flush
-        if pend_done or pend_failed:
-            out = state.submit(run_id, list(pend_done), list(pend_failed))
+        _flush_attrs(state, run_id, pend_attrs)   # first: a raising results submit must not skip it
+        send, keep = (_withhold_for_unsent_attrs(pend_done, pend_attrs) if final
+                      else (list(pend_done), []))
+        if send or pend_failed:
+            out = state.submit(run_id, send, list(pend_failed))
             acc = int(out.get("accepted", 0))
             stale = int(out.get("stale", 0))
             # accepted spans both done+failed; count locally for logging only
-            result.done += len([d for d in pend_done])
-            result.failed += len([f for f in pend_failed])
+            result.done += len(send)
+            result.failed += len(pend_failed)
             logger.info("phase2.flush submitted=%d accepted=%d stale=%d done_total=%d failed_total=%d rps=%.3f",
-                        len(pend_done) + len(pend_failed), acc, stale, result.done, result.failed,
+                        len(send) + len(pend_failed), acc, stale, result.done, result.failed,
                         (result.done + result.failed) / max(0.001, time.monotonic() - started))
-        pend_done.clear()
+        pend_done[:] = keep
         pend_failed.clear()
-        _flush_attrs(state, run_id, pend_attrs)
         last_flush = time.monotonic()
 
     n_since_recycle = 0
@@ -496,12 +517,13 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
                     n_since_recycle = 0
                 if (time.monotonic() - last_flush) >= flush_interval_s:
                     flush()
-        flush()
+        flush(final=True)
     finally:
         try:
             session.close()
         except Exception:
             pass
+    result.attrs_unsent = len(pend_attrs)
     logger.info("phase2.complete run_id=%s shard=%s done=%d failed=%d", run_id, shard, result.done, result.failed)
     return result
 
@@ -642,7 +664,7 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
                     logger.debug("recycle_failed", exc_info=True)
                 n_since_recycle = 0
 
-    def flush():
+    def flush(final: bool = False):
         with lock:
             done = pend_done[:]
             failed = pend_failed[:]
@@ -651,6 +673,13 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
             pend_failed.clear()
             pend_attrs.clear()
         _flush_attrs(state, run_id, attrs)
+        if attrs:   # not sent: back to the front, next flush (final flush included) retries
+            with lock:
+                pend_attrs[:0] = attrs
+        if final:
+            done, keep = _withhold_for_unsent_attrs(done, attrs)
+            with lock:
+                pend_done[:0] = keep
         if done or failed:
             try:
                 out = state.submit(run_id, done, failed)
@@ -731,7 +760,7 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
             if flush_interval_s and (time.monotonic() - last_flush) >= flush_interval_s:
                 flush()
                 last_flush = time.monotonic()
-        flush()  # final flush after every pid is accounted for
+        flush(final=True)  # final flush after every pid is accounted for
         with sessions_lock:
             for s in sessions:
                 try:
@@ -739,6 +768,7 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
                 except Exception:
                     pass
 
+    result.attrs_unsent = len(pend_attrs)
     logger.info("phase2.complete run_id=%s shard=%s done=%d failed=%d k=%d",
                 run_id, shard, result.done, result.failed, k)
     return result
@@ -802,16 +832,20 @@ class _GateState:
         return out
 
 
-def shard_exit_code(gate: _GateState, max_fail: float) -> int:
-    """0 ok, 3 = this shard lost work (§9 level 1). Results are already flushed."""
+def shard_exit_code(gate: _GateState, max_fail: float, attrs_unsent: int = 0) -> int:
+    """0 ok, 3 = this shard lost work (§9 level 1). Results are already flushed.
+    attrs_unsent: /attributes rows the final flush could not send; lost work like results."""
     lost = gate.leased - gate.submitted
     den = gate.acc_done + gate.acc_failed
     rate = gate.acc_failed / den if den else 0.0
     logger.info("phase2.gate leased=%d submitted=%d accepted_done=%d accepted_failed=%d "
-                "unflushed=%d fail_rate=%.3f max=%.3f",
-                gate.leased, gate.submitted, gate.acc_done, gate.acc_failed, lost, rate, max_fail)
-    if lost > 0:
-        logger.error("phase2.gate exit=3 reason=unflushed_buffer rows=%d", lost)
+                "unflushed=%d fail_rate=%.3f max=%.3f api_503=%d attrs_unsent=%d",
+                gate.leased, gate.submitted, gate.acc_done, gate.acc_failed, lost, rate, max_fail,
+                int(getattr(gate, "api_503", 0) or 0), attrs_unsent)
+    reasons = [r for r, n in (("unflushed_buffer", lost), ("attrs_unsent", attrs_unsent)) if n > 0]
+    if reasons:   # both named when both lost work: no reason hides the other
+        logger.error("phase2.gate exit=3 reason=%s unflushed=%d attrs_unsent=%d",
+                     "+".join(reasons), lost, attrs_unsent)
         return 3
     if gate.leased and not den:
         logger.error("phase2.gate exit=3 reason=no_accepted_rows leased=%d", gate.leased)
@@ -843,10 +877,10 @@ def main(argv=None, state=None) -> int:
     os.environ.setdefault("PARALLEL_SCRAPER_STDERR_LEVEL", level)
     setup_logging(None, level=level)
     gate = _GateState(state if state is not None else HttpState())
-    run_worker(args.run_id, args.shard, max_minutes=args.max_minutes,
-               batch=args.batch, max_places=args.max_places,
-               concurrency=args.concurrency, state=gate)
-    return shard_exit_code(gate, args.max_fail_pct / 100.0)
+    res = run_worker(args.run_id, args.shard, max_minutes=args.max_minutes,
+                     batch=args.batch, max_places=args.max_places,
+                     concurrency=args.concurrency, state=gate)
+    return shard_exit_code(gate, args.max_fail_pct / 100.0, attrs_unsent=res.attrs_unsent)
 
 
 if __name__ == "__main__":
