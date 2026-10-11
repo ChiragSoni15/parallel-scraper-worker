@@ -6,12 +6,20 @@ reclaim_place_ids) by calling the lease/submit API over HTTPS. Holds only
 network/5xx errors with backoff (lease/submit are idempotent on the server side)."""
 from __future__ import annotations
 
+import json
+import logging
 import os
 import random
 import threading
 import time
 
 import requests
+
+logger = logging.getLogger(__name__)
+
+
+class PayloadTooLarge(Exception):
+    """HTTP 413. Not a RequestException: _request never retries it (same body, same answer)."""
 
 
 class HttpState:
@@ -44,6 +52,8 @@ class HttpState:
             final = attempt == self._ATTEMPTS - 1
             try:
                 r = self._s.request(method, self.base + path, json=json, params=params, timeout=self.timeout)
+                if r.status_code == 413:
+                    raise PayloadTooLarge(f"413 {path}: {r.text[:200]}")
                 ra = r.headers.get("Retry-After") if r.status_code == 503 else None
                 if ra is not None:
                     # Load shed (cloud/api.py): no DB work was done. Wait what the API asks
@@ -95,9 +105,58 @@ class HttpState:
         self.last_lease = out
         return out.get("pids", [])
 
+    # A 120 s flush is ~12 rows (~0.2-0.5 MB), but a failed flush requeues its rows, so
+    # the next batch grows. Past cloud/api.py WORKER_MAX_RESULTS (200 rows) or the ingress
+    # body limit (nginx default 1 MB) every retry was a 413 and the rows never landed.
+    _SUBMIT_MAX_ROWS = int(os.environ.get("WORKER_SUBMIT_MAX_ROWS", "200"))
+    _SUBMIT_MAX_BYTES = int(os.environ.get("WORKER_SUBMIT_MAX_BYTES", "900000"))
+
     def submit(self, run_id: str, done: list[dict], failed: list[dict]) -> dict:
-        return self._request("POST", "/phase2/results",
-                            json={"run_id": run_id, "done": done, "failed": failed})
+        """POST results in chunks whose whole request body stays under the byte cap and
+        the row cap; counts are summed. On 413 a chunk is halved and resent, down to one
+        row. A single row that still gets 413 is logged with its place_id and returned in
+        `rejected`: the caller does not requeue it (it would 413 forever) and the shard
+        gate counts it as lost work (exit 3). Any other failure raises as before: the
+        caller requeues all rows, and rows that already landed come back stale."""
+        items = [("done", d) for d in done] + [("failed", f) for f in failed]
+        if not items:
+            return self._request("POST", "/phase2/results",
+                                 json={"run_id": run_id, "done": [], "failed": []})
+        total: dict = {"rejected": []}
+        envelope = len(json.dumps({"run_id": run_id, "done": [], "failed": []}))
+        chunk: list = []
+        size = envelope
+        for kind, item in items:
+            # exact body length as requests' json.dumps writes it: ", " between list items
+            b = len(json.dumps(item)) + (2 if any(k == kind for k, _ in chunk[-1:]) else 0)
+            if chunk and (len(chunk) >= self._SUBMIT_MAX_ROWS or size + b > self._SUBMIT_MAX_BYTES):
+                self._post_results(run_id, chunk, total)
+                chunk, size = [], envelope
+                b = len(json.dumps(item))
+            chunk.append((kind, item))
+            size += b
+        self._post_results(run_id, chunk, total)
+        return total
+
+    def _post_results(self, run_id: str, chunk: list, total: dict) -> None:
+        body = {"run_id": run_id, "done": [i for k, i in chunk if k == "done"],
+                "failed": [i for k, i in chunk if k == "failed"]}
+        try:
+            out = self._request("POST", "/phase2/results", json=body)
+        except PayloadTooLarge:
+            if len(chunk) == 1:
+                pid = chunk[0][1].get("place_id")
+                logger.error("phase2.submit_rejected_413 place_id=%s bytes=%d (dropped; counted as lost)",
+                             pid, len(json.dumps(body)))
+                total["rejected"].append(pid)
+                return
+            half = len(chunk) // 2
+            self._post_results(run_id, chunk[:half], total)
+            self._post_results(run_id, chunk[half:], total)
+            return
+        for k, v in (out or {}).items():
+            if isinstance(v, int) and not isinstance(v, bool):
+                total[k] = total.get(k, 0) + v
 
     def submit_attributes(self, run_id: str, rows: list[dict]) -> dict:
         """POST Overview-pass scalars. Best-effort at the call site: these are

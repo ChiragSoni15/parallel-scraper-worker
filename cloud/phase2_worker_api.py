@@ -805,7 +805,8 @@ class _GateState:
     def submit(self, run_id, done, failed):
         out = self._inner.submit(run_id, done, failed) or {}
         with self._lock:
-            self.submitted += len(done) + len(failed)
+            # rows the API refused even alone (413) are not submitted: lost work, exit 3
+            self.submitted += len(done) + len(failed) - len(out.get("rejected") or [])
             if "accepted_done" in out and "accepted_failed" in out:
                 self.acc_done += int(out["accepted_done"])
                 self.acc_failed += int(out["accepted_failed"])
