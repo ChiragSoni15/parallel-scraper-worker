@@ -342,13 +342,13 @@ def _flush_attrs(state, run_id, pend_attrs):
 
 
 def _lease_with_retry(state, run_id, shard, batch, attempts: int = 5,
-                      deadline: float | None = None):
+                      deadline: float | None = None, flush=None):
     """Claim a batch, retrying on empty results. Empty lease != empty queue.
 
     The API (design §9.2) answers an empty lease with `pending`: true while the run
     still has queued or scraping rows (held in another API pod's buffer, READPAST-
     skipped, or in flight on live shards that may release them). Then sleep its
-    `retry_after_s` and retry, up to PHASE2_EMPTY_LEASE_MAX_WAIT_S (600) in total;
+    `retry_after_s` and retry, up to PHASE2_EMPTY_LEASE_MAX_WAIT_S (180) in total;
     `pending` false means drained, so return at once. Pilot p200: a shard whose
     lease hit a pod with nothing buffered exited after the old ladder while 52 rows
     were still 'scraping' in another pod's buffer.
@@ -358,8 +358,16 @@ def _lease_with_retry(state, run_id, shard, batch, attempts: int = 5,
 
     `deadline` is a time.monotonic() stamp past which waiting is pointless — the
     shard is out of budget and will exit on the next loop anyway.
+
+    `flush` (the caller's result flush, a no-op on an empty buffer) runs before every
+    pending sleep. w2: each shard held its last 13-18 results through the whole wait,
+    and those unflushed rows were the 'scraping' that kept every shard's lease
+    pending (8-10 min tail, 15% of wall clock). Flushed, the run drains to
+    pending=false as soon as the last place is done. Default 180 s: after the flush
+    only rows un-served in another API pod's buffer can still come back, and those
+    are released at PHASE2_LEASE_MAX_AGE_S (600) — a later top-up run picks them up.
     """
-    max_wait = float(os.environ.get("PHASE2_EMPTY_LEASE_MAX_WAIT_S") or 600)
+    max_wait = float(os.environ.get("PHASE2_EMPTY_LEASE_MAX_WAIT_S") or 180)
     waited, i = 0.0, 0
     while True:
         leased = state.claim_place_ids(run_id, str(shard), int(batch))
@@ -381,6 +389,8 @@ def _lease_with_retry(state, run_id, shard, batch, attempts: int = 5,
                             run_id, shard, waited)
             return []
         pause = max(1.0, float(info.get("retry_after_s") or 15))
+        if flush is not None:
+            flush()
         time.sleep(pause)
         waited += pause
 
@@ -461,7 +471,7 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
             if max_places is not None and (result.done + result.failed + len(pend_done) + len(pend_failed)) >= max_places:
                 break
             leased = _lease_with_retry(state, run_id, shard, batch,
-                                       deadline=started + stop_after)
+                                       deadline=started + stop_after, flush=flush)
             if not leased:
                 break
             for rec in leased:
@@ -676,6 +686,11 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
     # queue has drained below the high-water mark.
     high_water = max(int(batch), 2 * k)
     last_flush = started
+
+    def wait_flush():
+        nonlocal last_flush
+        flush()
+        last_flush = time.monotonic()
     try:
         while True:
             now = time.monotonic()
@@ -692,7 +707,7 @@ def _run_worker_concurrent(run_id, shard, k, max_minutes, batch, state,
                 time.sleep(0.2)
                 continue
             leased = _lease_with_retry(state, run_id, shard, batch,
-                                       deadline=started + stop_after)
+                                       deadline=started + stop_after, flush=wait_flush)
             if not leased:
                 break
             for rec in leased:

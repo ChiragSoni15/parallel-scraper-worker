@@ -464,14 +464,13 @@ class PlaywrightSession:
 
     def _recover_degraded(self, reload_and_check) -> tuple[str, object]:
         """Get a full page back after a degraded render. `reload_and_check` is an async
-        fn that re-opens the place and returns (full, result). A new context seeded with
-        the good cookies first (when there are any), then, if still degraded, a browser
-        relaunch (~20 s, ~half recover). Returns (method, result of the last attempt):
-        cookie_context | relaunch_no_cookies (nothing full seen yet in this browser:
-        unavoidable) | relaunch_after_cookie (the seeded context stayed degraded).
-        p200 logged only the last step: 19 of 30 unrecovered retries took ~34 s (seeded
-        try + relaunch) against ~18 s (relaunch only), all recorded as 'relaunch'."""
-        reason = "relaunch_no_cookies"
+        fn that re-opens the place and returns (full, result). One step only:
+        cookie_context (a new context seeded with the good cookies, when there are any)
+        or relaunch_no_cookies (nothing full seen yet in this browser). Returns
+        (method, result); result is None when the step raised.
+        w2: a relaunch after a failed seeded context recovered 6 of 250 places for
+        2.8 runner-hours, so a failed cookie_context is final (degraded_unrecovered)."""
+        res = None
         if self._good_cookies and self._browser is not None:
             t0 = time.monotonic()
             full = False
@@ -482,27 +481,16 @@ class PlaywrightSession:
                 logger.warning("phase2_session.cookie_context_failed", exc_info=True)
             logger.info("phase2_session.degraded_recovery step=cookie_context ok=%d cookies=%d ms=%d",
                         int(full), len(self._good_cookies), int((time.monotonic() - t0) * 1000))
-            if full:
-                return "cookie_context", res
-            # Still degraded: relaunch unseeded (a fresh draw). The saved cookies are set
-            # aside only for the launch and always put back: the caller replaces them
-            # once a walk on the new session proves it full (_remember_good).
-            kept, self._good_cookies = self._good_cookies, []
-            reason = "relaunch_after_cookie"
+            return "cookie_context", res
         t0 = time.monotonic()
-        full = False
-        try:
-            self._close_browser()
-            self._open_browser()
-            full, res = self._loop.run_until_complete(reload_and_check())
-        finally:   # success, failure or an exception: the old cookies stay until a proof
-            if reason == "relaunch_after_cookie":
-                self._good_cookies = kept
-        logger.info("phase2_session.degraded_recovery step=%s ok=%d ms=%d", reason, int(full),
-                    int((time.monotonic() - t0) * 1000))
+        self._close_browser()
+        self._open_browser()
+        full, res = self._loop.run_until_complete(reload_and_check())
+        logger.info("phase2_session.degraded_recovery step=relaunch_no_cookies ok=%d ms=%d",
+                    int(full), int((time.monotonic() - t0) * 1000))
         # No _remember_good here: a full tab strip can sit on a degraded gallery (live),
         # so the caller stores cookies only after a full walk.
-        return reason, res
+        return "relaunch_no_cookies", res
 
     def recycle(self) -> None:
         """Recycle between scrape batches. Page-only by default (fast, keeps
@@ -633,7 +621,8 @@ class PlaywrightSession:
             if ex.get("degraded"):
                 # Session-scoped degraded panel (no tab strip): retry once on a seeded
                 # new context, else a relaunched browser.
-                method, ex = self._recover_degraded(_retry)
+                method, ex2 = self._recover_degraded(_retry)
+                ex = ex2 or ex      # a raised step keeps the first capture
                 logger.info("phase2_session.panel_degraded place_id=%s method=%s recovered=%d",
                             place_id, method, int(not ex.get("degraded")))
             return ex
@@ -658,8 +647,9 @@ class PlaywrightSession:
         seeded with the last full page's cookies, else a relaunched browser) within the
         same PHASE2_WALK_MAX_S budget; an unrecovered retry keeps the walk with more
         items. walk_meta gets degraded_retry=1, degraded_recovered,
-        degraded_recovery_method (cookie_context|relaunch_no_cookies|relaunch_after_cookie) (and degraded_panel=1 when the tabs
-        were degraded); the scrape() panel data is kept either way."""
+        degraded_recovery_method (cookie_context|relaunch_no_cookies|error) (and degraded_panel=1 when the tabs
+        were degraded); an unrecovered retry adds truncated reason degraded_unrecovered.
+        The scrape() panel data is kept either way."""
         import os as _os
         if not self._page_alive():
             return None
@@ -755,6 +745,7 @@ class PlaywrightSession:
                         return not _degraded(lb), lb
                     try:
                         method, labels2 = self._recover_degraded(_retry)
+                        labels2 = labels2 or []
                         logger.info("phase2_session.panel_tabs place_id=%s retry=1 tabs=%s", place_id,
                                     ",".join(labels2)[:200])
                         left = max_s - int(time.monotonic() - t_start)
@@ -787,6 +778,14 @@ class PlaywrightSession:
                         hc["walk_meta"]["degraded_retry"] = 1
                         hc["walk_meta"]["degraded_recovered"] = 0
                         hc["walk_meta"]["degraded_recovery_method"] = method
+                    wm = hc["walk_meta"]
+                    if not wm.get("degraded_recovered"):
+                        # No further step: the place stays degraded (w2: 6 of 250 after a
+                        # relaunch).
+                        reasons = wm.setdefault("truncated_reasons", [])
+                        if "degraded_unrecovered" not in reasons:
+                            reasons.append("degraded_unrecovered")
+                        wm["truncated"] = 1
             if bad_panel:
                 hc["walk_meta"]["degraded_panel"] = 1
         except Exception:
